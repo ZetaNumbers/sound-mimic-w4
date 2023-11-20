@@ -1,0 +1,10 @@
+[package]
+name = "sound-mimic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.75"
+hound = "3.5.1"
+plotters = "0.3.5"
+wt = { package = "wasmtime", version = "14.0.4" }
