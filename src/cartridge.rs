@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use crate::audio::Audio;
 
 pub struct Cartridge {
@@ -8,17 +6,14 @@ pub struct Cartridge {
 }
 
 impl Cartridge {
-    pub fn load<P>(path: P) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        fn load_impl(path: &Path) -> Cartridge {
+    pub fn new(bytes: impl AsRef<[u8]>) -> Self {
+        fn impl_(bytes: &[u8]) -> Cartridge {
             let engine = wt::Engine::default();
 
             let mut store = wt::Store::new(&engine, State::default());
             let mem = wt::Memory::new(&mut store, wt::MemoryType::new(1, Some(1))).unwrap();
 
-            let module = wt::Module::from_file(&engine, path).unwrap();
+            let module = wt::Module::new(&engine, bytes).unwrap();
 
             let mut linker = wt::Linker::new(&engine);
             linker
@@ -57,7 +52,7 @@ impl Cartridge {
             Cartridge { update, store }
         }
 
-        load_impl(path.as_ref())
+        impl_(bytes.as_ref())
     }
 
     pub fn update(&mut self) {
