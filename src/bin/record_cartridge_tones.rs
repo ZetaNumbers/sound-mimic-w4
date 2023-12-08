@@ -13,8 +13,9 @@ struct RecordCartridgeTones {
     /// amount of frames to record
     #[argh(positional)]
     frames: usize,
-    // TODO: document gamestate extraction method in github issue and link to it
-    /// load gamestate (memory) from stdin
+    /// load gamestate (memory) from stdin, see
+    /// https://github.com/aduros/wasm4/issues/553#issuecomment-1847569775
+    /// to learn how to extract gamestate from a running cartridge
     #[argh(switch)]
     load_stdin: bool,
     /// do not crop durations that would last after `frames` have passed, causes
