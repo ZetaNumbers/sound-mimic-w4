@@ -185,10 +185,11 @@ impl Channel {
             start_frequency
         };
 
-        let attack_to = i64::from((duration >> 24 & 0xFF) * samples_per_frame);
-        let decay_to = attack_to + i64::from((duration >> 16 & 0xFF) * samples_per_frame);
-        let sustain_to = decay_to + i64::from((duration & 0xFF) * samples_per_frame);
-        let release_to = sustain_to + i64::from((duration >> 8 & 0xFF) * samples_per_frame);
+        let durations = Durations::from(duration);
+        let attack_to = i64::from(durations.attack_to * samples_per_frame);
+        let decay_to = i64::from(durations.decay_to * samples_per_frame);
+        let sustain_to = i64::from(durations.sustain_to * samples_per_frame);
+        let release_to = i64::from(durations.release_to * samples_per_frame);
 
         let sustain_volume = (volume & 0xFFFF).min(100) as f32 / 100.0;
         let peak_volume = (volume >> 16 & 0xFFFF).min(100);
@@ -320,5 +321,54 @@ impl Channel {
             left: if self.pan_left { sample } else { 0.0 },
             right: if self.pan_right { sample } else { 0.0 },
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Durations {
+    attack_to: u32,
+    decay_to: u32,
+    sustain_to: u32,
+    release_to: u32,
+}
+
+impl Durations {
+    #[must_use]
+    pub fn crop(self, frames: u32) -> Durations {
+        Durations {
+            attack_to: self.attack_to.min(frames),
+            decay_to: self.decay_to.min(frames),
+            sustain_to: self.sustain_to.min(frames),
+            release_to: self.release_to.min(frames),
+        }
+    }
+}
+
+impl From<u32> for Durations {
+    fn from(duration: u32) -> Durations {
+        let attack_to = duration >> 24 & 0xFF;
+        let decay_to = attack_to + (duration >> 16 & 0xFF);
+        let sustain_to = decay_to + (duration & 0xFF);
+        let release_to = sustain_to + (duration >> 8 & 0xFF);
+        Durations {
+            attack_to,
+            decay_to,
+            sustain_to,
+            release_to,
+        }
+    }
+}
+
+impl From<Durations> for u32 {
+    fn from(durations: Durations) -> u32 {
+        let attack = durations.attack_to;
+        assert_eq!(attack & !0xFF, 0);
+        let decay = durations.decay_to - durations.attack_to;
+        assert_eq!(decay & !0xFF, 0);
+        let sustain = durations.sustain_to - durations.decay_to;
+        assert_eq!(sustain & !0xFF, 0);
+        let release = durations.release_to - durations.sustain_to;
+        assert_eq!(release & !0xFF, 0);
+        attack << 24 | decay << 16 | sustain | release << 8
     }
 }
