@@ -1,16 +1,30 @@
-use std::io::Write as _;
-
 use rustfft::num_complex::{Complex, Complex32};
-use sound_mimic::{audio, FRAMERATE};
+use sound_mimic::{audio, tone_stream, FRAMERATE};
+
+// WARN: Update README.md documentation if cli documentation below is changed
+// TODO: Option to choose wave channels and their settings
+/// Chooses most suitable tones for each frame of input sound (wav file)
+/// and outputs these tones as CSV table in stdout.
+#[derive(argh::FromArgs)]
+struct Mimic {}
 
 fn main() {
+    let _args: Mimic = argh::from_env();
     let input = std::io::stdin().lock();
     let wav = hound::WavReader::new(input).unwrap();
     let wav_spec = wav.spec();
-    assert_eq!(wav_spec.channels, 1);
-    assert_eq!(wav_spec.sample_rate % FRAMERATE, 0);
-    assert_eq!(wav_spec.bits_per_sample, 16);
-    assert_eq!(wav_spec.sample_format, hound::SampleFormat::Int);
+    // TODO: stereo support?
+    assert_eq!(wav_spec.channels, 1, "input sound has to have one channel");
+    assert_eq!(
+        wav_spec.sample_rate % FRAMERATE,
+        0,
+        "input sound has to have sample rate divisible by framerate ({FRAMERATE})",
+    );
+    assert_eq!(
+        (wav_spec.sample_format, wav_spec.bits_per_sample),
+        (hound::SampleFormat::Int, 16),
+        "input sound has to have samples of type i16"
+    );
 
     let width = wav_spec.sample_rate / FRAMERATE;
     // Eliminate last frame if it's incomplete with integer division
@@ -58,16 +72,19 @@ fn main() {
         };
         height
     ];
+
+    // TODO: parallelize?
     for frequency in 20..20000 {
         let mut channel = tone(frequency);
         tone_samples.fill_with(|| {
-            let sample = channel.sample_pulse_mono();
+            let sample = channel.sample_triangle_mono();
             channel.step_sample();
             Complex::new(sample, 0.0)
         });
 
         fft.plan_fft_forward(width)
             .process_with_scratch(&mut tone_samples, &mut scratch);
+        // TODO: normalize tone_samples elements and then entire vector
 
         for y in 0..height {
             let input_samples = &input_samples[y * width..][..width];
@@ -101,44 +118,19 @@ fn main() {
             .reduce(|a, b| a.max(b))
             .unwrap();
 
-    tone_samples = vec![Complex32::new(0.0, 0.0); width * height];
-    let mut phase = 0.0;
-    for (y, &t) in best_tones.iter().enumerate() {
+    // TODO: output tone CSV table
+    let mut writer = tone_stream::Writer::new(std::io::stdout().lock()).unwrap();
+    for t in &best_tones {
         let volume = (100.0 * t.amplitude() * inv_max_amplitude)
             .trunc()
             .clamp(0.0, 100.0) as u32;
-        let frequency = t.frequency;
-        eprintln!("Tone {{ frequency: {frequency:5}, volume: {volume:3} }}");
-        let mut channel =
-            audio::Channel::with_phase(wav_spec.sample_rate, frequency, 1, volume, 0, phase);
-        for tone_sample in &mut tone_samples[y * width..][..width] {
-            *tone_sample = channel.sample_pulse_mono().into();
-            channel.step_sample();
-        }
-        phase = channel.phase;
+        writer
+            .write_tone(t.frequency, 1, volume, audio::TRIANGLE_CHANNEL)
+            .unwrap();
+        writer.step_frame().unwrap();
     }
-
-    output_audio(tone_samples, wav_spec);
 }
 
 fn sound_intencity_sqr(complex_amplitude: Complex32, frequency: f32) -> f32 {
     complex_amplitude.norm_sqr() * frequency * frequency
-}
-
-fn output_audio(samples: Vec<Complex<f32>>, wav_spec: hound::WavSpec) {
-    let mut output = std::io::Cursor::new(Vec::new());
-    let mut wav = hound::WavWriter::new(&mut output, wav_spec).unwrap();
-    for sample in samples {
-        wav.write_sample(
-            (sample.re * -(i16::MIN as f32))
-                .round()
-                .clamp(i16::MIN as f32, i16::MAX as f32) as i16,
-        )
-        .unwrap();
-    }
-    wav.finalize().unwrap();
-    std::io::stdout()
-        .lock()
-        .write_all(output.get_ref())
-        .unwrap();
 }

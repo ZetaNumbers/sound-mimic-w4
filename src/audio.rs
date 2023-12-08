@@ -1,8 +1,8 @@
 use crate::{utils::Lerp, FRAMERATE};
 
-/// `-1.0..1.0 => -i16::MAX..i16::MAX`
+/// `-1.0..1.0 => i16::MIN..-i16::MIN`
 pub fn sample_from_f32_into_i16(x: f32) -> i16 {
-    (x.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+    (-x * i16::MIN as f32) as i16
 }
 
 #[derive(Default, Clone, Copy)]
@@ -12,7 +12,7 @@ pub struct StereoSample<T> {
 }
 
 impl StereoSample<f32> {
-    /// `-1.0..1.0 => -i16::MAX..i16::MAX`
+    /// Uses [`sample_from_f32_into_i16`]
     pub fn into_i16(self) -> StereoSample<i16> {
         StereoSample {
             left: sample_from_f32_into_i16(self.left),
@@ -300,6 +300,7 @@ impl Channel {
         self.volume() * (2.0 * (2.0 * self.phase - 1.0).abs() - 1.0)
     }
 
+    // TODO
     pub fn sample_noise_mono(&self) -> f32 {
         0.0
     }

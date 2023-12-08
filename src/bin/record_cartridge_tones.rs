@@ -3,7 +3,9 @@ use std::{io::Read, path::PathBuf};
 use sound_mimic::{audio, cartridge, tone_stream, Cartridge};
 
 #[derive(argh::FromArgs)]
-/// Record cartridge played tones
+/// Record tones played on a cartridge. Outputs CSV table with recorded tones
+/// (`tone` function's arguments) into stdout. Note that tone durations are
+/// cropped by default (see `--no-duration-crop`).
 struct RecordCartridgeTones {
     /// path to WASM-4 cartridge
     #[argh(positional)]
@@ -11,14 +13,21 @@ struct RecordCartridgeTones {
     /// amount of frames to record
     #[argh(positional)]
     frames: usize,
+    // TODO: document gamestate extraction method in github issue and link to it
     /// load gamestate (memory) from stdin
     #[argh(switch)]
     load_stdin: bool,
+    /// do not crop durations that would last after `frames` have passed, causes
+    /// last tones to continue to play even after `frames` have passed, in other
+    /// words output unmodified tone arguments
+    #[argh(switch)]
+    no_duration_crop: bool,
 }
 
 fn main() {
     let args: RecordCartridgeTones = argh::from_env();
     let engine = ToneRecorder {
+        duration_crop: !args.no_duration_crop,
         ends_within: args.frames,
         writer: tone_stream::Writer::new(std::io::stdout().lock()).unwrap(),
     };
@@ -35,6 +44,7 @@ fn main() {
 }
 
 struct ToneRecorder<W> {
+    duration_crop: bool,
     ends_within: usize,
     writer: tone_stream::Writer<W>,
 }
@@ -47,7 +57,12 @@ impl<W: std::io::Write> cartridge::Engine for ToneRecorder<W> {
         volume: u32,
         flags: u32,
     ) -> anyhow::Result<()> {
-        if let Ok(ends_within) = self.ends_within.try_into() {
+        if let Some(ends_within) = self
+            .ends_within
+            .try_into()
+            .ok()
+            .filter(|_| self.duration_crop)
+        {
             duration = audio::Durations::from(duration).crop(ends_within).into();
         }
 

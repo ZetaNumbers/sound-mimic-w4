@@ -1,8 +1,28 @@
+use std::io::Write;
+
 use image::{imageops, DynamicImage, ImageBuffer};
 use rustfft::num_complex::{Complex, Complex32};
 use sound_mimic::FRAMERATE;
 
+// TODO: switch to render sound amplitude's logarithm instead of sound intencity level
+// WARN: Update README.md documentation if cli documentation below is changed
+/// Render spectogram of a sound (WAV file) from stdin into image and output
+/// it into stdout. Spectogram highlights sound intensity level, not amplitude.
+#[derive(argh::FromArgs)]
+struct Spectogram {
+    /// format of output image using specified extension
+    #[argh(positional, from_str_fn(output_image_format_from_extension))]
+    image_format: image::ImageFormat,
+}
+
+fn output_image_format_from_extension(ext: &str) -> Result<image::ImageFormat, String> {
+    image::ImageFormat::from_extension(ext)
+        .filter(|fmt| fmt.can_write())
+        .ok_or_else(|| format!("unsupported output image format \"{ext:?}\""))
+}
+
 fn main() {
+    let args: Spectogram = argh::from_env();
     let input = std::io::stdin().lock();
     let wav = hound::WavReader::new(input).unwrap();
     let wav_spec = wav.spec();
@@ -29,10 +49,6 @@ fn main() {
     fft.plan_fft_forward(width as usize)
         .process(&mut input_samples);
 
-    output_spectogram(input_samples, width, height, half_width)
-}
-
-fn output_spectogram(samples: Vec<Complex<f32>>, width: u32, height: u32, half_width: u32) {
     let max_normal_reducer = |a: f32, b: f32| {
         if !a.is_normal() || a <= b {
             b
@@ -41,7 +57,7 @@ fn output_spectogram(samples: Vec<Complex<f32>>, width: u32, height: u32, half_w
         }
     };
     let spectrums = || {
-        samples
+        input_samples
             .chunks(width as usize)
             .map(|spectrum| &spectrum[..half_width as usize])
     };
@@ -68,6 +84,7 @@ fn output_spectogram(samples: Vec<Complex<f32>>, width: u32, height: u32, half_w
             .unwrap()
             .log2()
             + sound_sensitivity);
+    // TODO: use plotters and figure out units
     let img = ImageBuffer::<image::Luma<_>, _>::from_vec(
         half_width,
         height,
@@ -100,9 +117,21 @@ fn output_spectogram(samples: Vec<Complex<f32>>, width: u32, height: u32, half_w
         width - empty_frequencies,
     )
     .to_image();
-    let out = std::io::stdout().lock();
-    let encoder = image::codecs::qoi::QoiEncoder::new(out);
-    img.write_with_encoder(encoder).unwrap();
+
+    let mut out_buf = std::io::Cursor::new(Vec::new());
+    image::write_buffer_with_format(
+        &mut out_buf,
+        &img,
+        img.width(),
+        img.height(),
+        image::ColorType::Rgb8,
+        args.image_format,
+    )
+    .expect("encoding output image");
+    std::io::stdout()
+        .lock()
+        .write_all(out_buf.get_ref())
+        .expect("writing output image");
 }
 
 fn sound_intencity_sqr(complex_amplitude: Complex32, frequency: f32) -> f32 {

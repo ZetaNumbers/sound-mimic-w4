@@ -3,10 +3,11 @@ name = "sound-mimic"
 version = "0.1.0"
 edition = "2021"
 
+# TODO: executables should be able to drop dependencies via features (use required-features) (mention in readme)
 [dependencies]
 anyhow = "1.0.75"
 argh = "0.1.12"
 hound = "3.5.1"
-image = { version = "0.24.7", default-features = false, features = ["qoi"] }
+image = "0.24.7"
 rustfft = "6.1.0"
 wt = { package = "wasmtime", version = "14.0.4" }
