@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.75"
+argh = "0.1.12"
 hound = "3.5.1"
 image = { version = "0.24.7", default-features = false, features = ["qoi"] }
 rustfft = "6.1.0"

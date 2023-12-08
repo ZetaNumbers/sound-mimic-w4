@@ -1,22 +1,35 @@
-use std::{env, io::Read};
+use std::{io::Read, path::PathBuf};
 
 use sound_mimic::{cartridge, tone_stream, Cartridge};
 
+#[derive(argh::FromArgs)]
+/// Record cartridge played tones
+struct RecordCartridgeTones {
+    /// path to WASM-4 cartridge
+    #[argh(positional)]
+    cartridge: PathBuf,
+    // TODO: crop tones at the end
+    /// amount of frames to record
+    #[argh(positional)]
+    frames: usize,
+    /// load gamestate (memory) from stdin
+    #[argh(switch)]
+    load_stdin: bool,
+}
+
 fn main() {
-    let mut cartridge = Vec::new();
-    std::io::stdin().lock().read_to_end(&mut cartridge).unwrap();
+    let args: RecordCartridgeTones = argh::from_env();
     let engine = ToneRecorder {
         writer: tone_stream::Writer::new(std::io::stdout().lock()).unwrap(),
     };
-    let mut cartridge = Cartridge::new(cartridge, engine).unwrap();
+    let load_memory = args.load_stdin.then(|| {
+        let mut buf = Box::new([0; cartridge::MEMORY_SIZE]);
+        std::io::stdin().lock().read_exact(&mut *buf).unwrap();
+        buf
+    });
+    let mut cartridge = Cartridge::new(args.cartridge, engine, load_memory.as_deref()).unwrap();
 
-    let frames: u32 = env::args()
-        .nth(1)
-        .expect("No first argument (frames) was provided")
-        .parse()
-        .expect("Could not properly parse first argument");
-
-    for _ in 0..frames {
+    for _ in 0..args.frames {
         cartridge.update().unwrap();
     }
 }

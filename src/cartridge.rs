@@ -1,4 +1,8 @@
+use std::path::Path;
+
 use anyhow::Context;
+
+pub const MEMORY_SIZE: usize = 0x10000;
 
 pub struct Cartridge<E> {
     update: wt::TypedFunc<(), ()>,
@@ -6,12 +10,20 @@ pub struct Cartridge<E> {
 }
 
 impl<E: Engine> Cartridge<E> {
-    pub fn new(bytes: impl AsRef<[u8]>, engine: E) -> anyhow::Result<Self> {
-        fn impl_<E: Engine>(bytes: &[u8], state: E) -> anyhow::Result<Cartridge<E>> {
+    pub fn new(
+        file: impl AsRef<Path>,
+        engine: E,
+        load_memory: Option<&[u8; MEMORY_SIZE]>,
+    ) -> anyhow::Result<Self> {
+        fn impl_<E: Engine>(
+            file: &Path,
+            state: E,
+            load_memory: Option<&[u8; MEMORY_SIZE]>,
+        ) -> anyhow::Result<Cartridge<E>> {
             let state = State { engine: state };
             let engine = wt::Engine::default();
             let mut store = wt::Store::new(&engine, state);
-            let module = wt::Module::new(&engine, bytes)?;
+            let module = wt::Module::from_file(&engine, file)?;
 
             let mut linker = wt::Linker::new(&engine);
             linker.define_unknown_imports_as_default_values(&module)?;
@@ -33,6 +45,9 @@ impl<E: Engine> Cartridge<E> {
             )?;
 
             let mem = wt::Memory::new(&mut store, wt::MemoryType::new(1, Some(1)))?;
+            if let Some(load_memory) = load_memory {
+                mem.write(&mut store, 0, load_memory)?;
+            }
             linker.define(&mut store, "env", "memory", mem)?;
 
             let instance = linker.instantiate(&mut store, &module)?;
@@ -47,14 +62,16 @@ impl<E: Engine> Cartridge<E> {
                 .typed::<(), ()>(&mut store)
                 .context("`update` funtion has wrong type, `fn() -> ()` expected")?;
 
-            store.data_mut().engine.before_start()?;
-            start.call(&mut store, ())?;
-            store.data_mut().engine.after_start()?;
+            if load_memory.is_none() {
+                store.data_mut().engine.before_start()?;
+                start.call(&mut store, ())?;
+                store.data_mut().engine.after_start()?;
+            }
 
             Ok(Cartridge { update, store })
         }
 
-        impl_(bytes.as_ref(), engine)
+        impl_(file.as_ref(), engine, load_memory)
     }
 
     pub fn update(&mut self) -> anyhow::Result<()> {
