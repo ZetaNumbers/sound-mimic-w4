@@ -1,6 +1,9 @@
-use crate::utils::Lerp;
+use crate::{utils::Lerp, FRAMERATE};
 
-pub const SAMPLE_RATE: u32 = 61440;
+/// `-1.0..1.0 => -i16::MAX..i16::MAX`
+pub fn sample_from_f32_into_i16(x: f32) -> i16 {
+    (x.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
 
 #[derive(Default, Clone, Copy)]
 pub struct StereoSample<T> {
@@ -12,8 +15,8 @@ impl StereoSample<f32> {
     /// `-1.0..1.0 => -i16::MAX..i16::MAX`
     pub fn into_i16(self) -> StereoSample<i16> {
         StereoSample {
-            left: (self.left.clamp(-1.0, 1.0) * i16::MAX as f32) as i16,
-            right: (self.right.clamp(-1.0, 1.0) * i16::MAX as f32) as i16,
+            left: sample_from_f32_into_i16(self.left),
+            right: sample_from_f32_into_i16(self.right),
         }
     }
 }
@@ -66,7 +69,7 @@ where
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Audio {
     pub pulse1: Channel,
     pub pulse2: Channel,
@@ -75,6 +78,15 @@ pub struct Audio {
 }
 
 impl Audio {
+    pub fn new(sample_rate: u32) -> Self {
+        Audio {
+            pulse1: Channel::new(sample_rate, 0, 0, 0, 0),
+            pulse2: Channel::new(sample_rate, 0, 0, 0, 0),
+            triangle: Channel::new(sample_rate, 0, 0, 0, 0),
+            noise: Channel::new(sample_rate, 0, 0, 0, 0),
+        }
+    }
+
     pub fn sample(&self) -> StereoSample<i16> {
         let mut samples = StereoSample::default();
         samples += self.pulse1.sample_pulse();
@@ -92,18 +104,29 @@ impl Audio {
         sample += self.triangle.sample_triangle_mono();
         sample += self.noise.sample_noise_mono();
         sample *= 0.25;
-        sample as i16
+        sample_from_f32_into_i16(sample)
     }
 
     pub fn tone(&mut self, frequency: u32, duration: u32, volume: u32, flags: u32) {
-        let (phase, channel) = match flags & 0b11 {
-            0 => (self.pulse1.phase, &mut self.pulse1),
-            1 => (self.pulse2.phase, &mut self.pulse2),
-            2 => (self.triangle.phase, &mut self.triangle),
-            3 => (self.noise.phase, &mut self.noise),
+        let (sample_rate, phase, channel) = match flags & 0b11 {
+            0 => (self.pulse1.sample_rate, self.pulse1.phase, &mut self.pulse1),
+            1 => (self.pulse2.sample_rate, self.pulse2.phase, &mut self.pulse2),
+            2 => (
+                self.triangle.sample_rate,
+                self.triangle.phase,
+                &mut self.triangle,
+            ),
+            3 => (self.noise.sample_rate, self.noise.phase, &mut self.noise),
             _ => unreachable!(),
         };
-        *channel = Channel::with_phase(frequency, duration, volume, flags, phase);
+        *channel = Channel::with_phase(sample_rate, frequency, duration, volume, flags, phase);
+    }
+
+    pub fn has_ended(&self) -> bool {
+        self.pulse1.has_ended()
+            && self.pulse2.has_ended()
+            && self.triangle.has_ended()
+            && self.noise.has_ended()
     }
 
     pub fn step_sample(&mut self) {
@@ -114,8 +137,14 @@ impl Audio {
     }
 }
 
-#[derive(Default, Clone, Debug)]
+pub const PULSE1_CHANNEL: u32 = 0;
+pub const PULSE2_CHANNEL: u32 = 1;
+pub const TRIANGLE_CHANNEL: u32 = 2;
+pub const NOISE_CHANNEL: u32 = 3;
+
+#[derive(Clone, Debug)]
 pub struct Channel {
+    sample_rate: u32,
     start_frequency: f32,
     end_frequency: f32,
     start_at: i64,
@@ -129,15 +158,25 @@ pub struct Channel {
     duty_cycle: u32,
     pan_left: bool,
     pan_right: bool,
-    phase: f32,
+    pub phase: f32,
 }
 
 impl Channel {
-    pub fn new(frequency: u32, duration: u32, volume: u32, flags: u32) -> Self {
-        Channel::with_phase(frequency, duration, volume, flags, 0.0)
+    pub fn new(sample_rate: u32, frequency: u32, duration: u32, volume: u32, flags: u32) -> Self {
+        Channel::with_phase(sample_rate, frequency, duration, volume, flags, 0.0)
     }
 
-    pub fn with_phase(frequency: u32, duration: u32, volume: u32, flags: u32, phase: f32) -> Self {
+    pub fn with_phase(
+        sample_rate: u32,
+        frequency: u32,
+        duration: u32,
+        volume: u32,
+        flags: u32,
+        phase: f32,
+    ) -> Self {
+        assert_eq!(sample_rate % FRAMERATE, 0);
+        let samples_per_frame = sample_rate / FRAMERATE;
+
         let start_frequency = (frequency & 0xFFFF) as f32;
         let end_frequency = frequency >> 16 & 0xFFFF;
         let end_frequency = if end_frequency != 0 {
@@ -146,19 +185,18 @@ impl Channel {
             start_frequency
         };
 
-        let attack_to = i64::from((duration >> 24 & 0xFF) * SAMPLE_RATE);
-        let decay_to = attack_to + i64::from((duration >> 16 & 0xFF) * SAMPLE_RATE);
-        let sustain_to = decay_to + i64::from((duration & 0xFF) * SAMPLE_RATE);
-        let release_to = sustain_to + i64::from((duration >> 8 & 0xFF) * SAMPLE_RATE);
+        let attack_to = i64::from((duration >> 24 & 0xFF) * samples_per_frame);
+        let decay_to = attack_to + i64::from((duration >> 16 & 0xFF) * samples_per_frame);
+        let sustain_to = decay_to + i64::from((duration & 0xFF) * samples_per_frame);
+        let release_to = sustain_to + i64::from((duration >> 8 & 0xFF) * samples_per_frame);
 
         let sustain_volume = (volume & 0xFFFF).min(100) as f32 / 100.0;
         let peak_volume = (volume >> 16 & 0xFFFF).min(100);
-        let peak_volume =
-            if peak_volume != 0 {
-                peak_volume as f32 / 100.0
-            } else {
-                sustain_volume
-            };
+        let peak_volume = if peak_volume != 0 {
+            peak_volume as f32 / 100.0
+        } else {
+            sustain_volume
+        };
 
         let mode = flags >> 2 & 0b11;
         let duty_cycle = [1, 2, 4, 6][mode as usize];
@@ -169,6 +207,7 @@ impl Channel {
         };
 
         Channel {
+            sample_rate,
             start_frequency,
             end_frequency,
             start_at: 0,
@@ -185,6 +224,10 @@ impl Channel {
         }
     }
 
+    pub fn has_ended(&self) -> bool {
+        self.attack_to <= 0 && self.decay_to <= 0 && self.sustain_to <= 0 && self.release_to <= 0
+    }
+
     pub fn step_sample(&mut self) {
         let af = self.frequency();
         self.start_at = self.start_at.saturating_sub(1);
@@ -193,18 +236,29 @@ impl Channel {
         self.sustain_to = self.sustain_to.saturating_sub(1);
         self.release_to = self.release_to.saturating_sub(1);
         let bf = self.frequency();
-        self.phase = (self.phase + 1.0 / SAMPLE_RATE as f32 * 0.5 * (af + bf)).fract();
+        self.phase = (self.phase + 1.0 / self.sample_rate as f32 * 0.5 * (af + bf)).fract();
     }
 
     pub fn step_frame(&mut self) {
         let af = self.frequency();
-        self.start_at = self.start_at.saturating_sub((SAMPLE_RATE / 60).into());
-        self.attack_to = self.attack_to.saturating_sub((SAMPLE_RATE / 60).into());
-        self.decay_to = self.decay_to.saturating_sub((SAMPLE_RATE / 60).into());
-        self.sustain_to = self.sustain_to.saturating_sub((SAMPLE_RATE / 60).into());
-        self.release_to = self.release_to.saturating_sub((SAMPLE_RATE / 60).into());
+        self.start_at = self
+            .start_at
+            .saturating_sub((self.sample_rate / FRAMERATE).into());
+        self.attack_to = self
+            .attack_to
+            .saturating_sub((self.sample_rate / FRAMERATE).into());
+        self.decay_to = self
+            .decay_to
+            .saturating_sub((self.sample_rate / FRAMERATE).into());
+        self.sustain_to = self
+            .sustain_to
+            .saturating_sub((self.sample_rate / FRAMERATE).into());
+        self.release_to = self
+            .release_to
+            .saturating_sub((self.sample_rate / FRAMERATE).into());
         let bf = self.frequency();
-        self.phase = (self.phase + 60.0 / SAMPLE_RATE as f32 * 0.5 * (af + bf)).fract();
+        self.phase =
+            (self.phase + FRAMERATE as f32 / self.sample_rate as f32 * 0.5 * (af + bf)).fract();
     }
 
     pub fn volume(&self) -> f32 {
@@ -237,27 +291,27 @@ impl Channel {
         }
     }
 
-    fn sample_pulse_mono(&self) -> f32 {
+    pub fn sample_pulse_mono(&self) -> f32 {
         self.volume() * (self.duty_cycle as f32 - 8.0 * self.phase).signum()
     }
 
-    fn sample_triangle_mono(&self) -> f32 {
+    pub fn sample_triangle_mono(&self) -> f32 {
         self.volume() * (2.0 * (2.0 * self.phase - 1.0).abs() - 1.0)
     }
 
-    fn sample_noise_mono(&self) -> f32 {
+    pub fn sample_noise_mono(&self) -> f32 {
         0.0
     }
 
-    fn sample_pulse(&self) -> StereoSample<f32> {
+    pub fn sample_pulse(&self) -> StereoSample<f32> {
         self.stereo_norm(self.sample_pulse_mono())
     }
 
-    fn sample_triangle(&self) -> StereoSample<f32> {
+    pub fn sample_triangle(&self) -> StereoSample<f32> {
         self.stereo_norm(self.sample_triangle_mono())
     }
 
-    fn sample_noise(&self) -> StereoSample<f32> {
+    pub fn sample_noise(&self) -> StereoSample<f32> {
         self.stereo_norm(self.sample_noise_mono())
     }
 
