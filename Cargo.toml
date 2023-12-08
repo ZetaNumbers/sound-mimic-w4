@@ -7,6 +7,5 @@ edition = "2021"
 anyhow = "1.0.75"
 hound = "3.5.1"
 image = { version = "0.24.7", default-features = false, features = ["qoi"] }
-nalgebra = "0.32.3"
 rustfft = "6.1.0"
 wt = { package = "wasmtime", version = "14.0.4" }
