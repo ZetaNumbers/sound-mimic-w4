@@ -9,5 +9,14 @@ anyhow = "1.0.75"
 argh = "0.1.12"
 hound = "3.5.1"
 image = "0.24.7"
+nalgebra = "0.32.3"
+ordered-float = "4.2.0"
+rayon = "1.8.0"
 rustfft = "6.1.0"
+tracing = "0.1.40"
+tracing-timing = "0.6.0"
 wt = { package = "wasmtime", version = "14.0.4" }
+
+[profile.release]
+lto = false
+debug = true
