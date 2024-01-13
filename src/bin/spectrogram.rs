@@ -1,7 +1,10 @@
 use std::io::Write;
 
+use fft::{
+    num_complex::{Complex, Complex32},
+    FftPlanner,
+};
 use image::{imageops, DynamicImage, ImageBuffer};
-use rustfft::num_complex::{Complex, Complex32};
 use sound_mimic::FRAMERATE;
 
 // TODO: switch to render sound amplitude's logarithm instead of sound intencity level
@@ -45,7 +48,7 @@ fn main() {
         })
         .collect();
 
-    let mut fft = rustfft::FftPlanner::<f32>::new();
+    let mut fft = FftPlanner::<f32>::new();
     fft.plan_fft_forward(width as usize)
         .process(&mut input_samples);
 

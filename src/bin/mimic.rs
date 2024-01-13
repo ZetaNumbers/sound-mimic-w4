@@ -3,14 +3,14 @@ use std::{
     sync::Arc,
 };
 
-use nalgebra as na;
-use ordered_float::NotNan;
-use rayon::prelude::*;
-use rustfft::{
+use fft::{
     num_complex::{Complex, Complex32},
     num_traits::Zero,
     Fft, FftPlanner,
 };
+use nalgebra as na;
+use ordered_float::NotNan;
+use rayon::prelude::*;
 use sound_mimic::{audio, tone_stream, FRAMERATE};
 
 // WARN: Update README.md documentation if cli documentation below is changed
@@ -311,13 +311,13 @@ fn fourier_scale_factor(len: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{fourier_scale_factor, na};
-    use rustfft::num_complex::Complex32;
+    use fft::{num_complex::Complex32, FftPlanner};
 
     #[test]
     fn spectral_density_scale_factor() {
         const SAMPLE_COUNT: usize = 1024;
 
-        let mut fft_planner = rustfft::FftPlanner::new();
+        let mut fft_planner = FftPlanner::new();
         let mut v = na::DVector::from_fn(SAMPLE_COUNT, |i, _| {
             let t = i as f32 * std::f32::consts::TAU / SAMPLE_COUNT as f32;
             Complex32::from_polar(1.0, t)
