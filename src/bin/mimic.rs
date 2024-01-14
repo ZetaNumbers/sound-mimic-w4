@@ -15,6 +15,9 @@ use ordered_float::NotNan;
 use rayon::prelude::*;
 use sound_mimic::{audio, tone_stream, FRAMERATE};
 
+const MIN_FREQUENCY: u32 = 20;
+const MAX_FREQUENCY: u32 = 20000;
+
 // WARN: Update README.md documentation if cli documentation below is changed
 // TODO: Option to choose wave channels and their settings
 /// Chooses most suitable tones for each frame of input sound (wav file)
@@ -145,28 +148,41 @@ impl ComplexSamplesInSlidingFrames {
             conjugate_rows: Range<usize>,
             forward_fft: Arc<dyn Fft<f32>>,
             fft_descale: f32,
+            tone_spectrums: na::DMatrix<f32>,
+            original_descale: Vec<NotNan<f32>>,
         }
 
         impl Context {
             fn new(samples_per_frame: usize) -> Self {
                 let mut fft_planner = FftPlanner::<f32>::new();
-                Context {
-                    lower_nonconjugate_nrows: samples_per_frame / 2 + 1,
+                let lower_nonconjugate_nrows = samples_per_frame / 2 + 1;
+                let mut out = Context {
                     conjugate_rows: 1..(samples_per_frame + 1) / 2,
                     forward_fft: fft_planner.plan_fft_forward(samples_per_frame),
                     fft_descale: fourier_scale_factor(samples_per_frame),
+                    tone_spectrums: na::DMatrix::zeros(
+                        lower_nonconjugate_nrows,
+                        (MAX_FREQUENCY - MIN_FREQUENCY).try_into().unwrap(),
+                    ),
+                    original_descale: Vec::new(),
+                    lower_nonconjugate_nrows,
                     samples_per_frame,
-                }
+                };
+                out.tone_bases_init();
+                out
             }
 
-            fn tone(&self, frequency: u32) -> audio::Channel {
-                audio::Channel::new(
-                    self.samples_per_frame as u32 * FRAMERATE,
-                    frequency,
-                    1,
-                    100,
-                    audio::PULSE1_CHANNEL,
-                )
+            fn tone_generator(&self) -> impl Fn(u32) -> audio::Channel {
+                let samples_per_frame = self.samples_per_frame;
+                move |frequency| {
+                    audio::Channel::new(
+                        samples_per_frame as u32 * FRAMERATE,
+                        frequency,
+                        1,
+                        100,
+                        audio::PULSE1_CHANNEL,
+                    )
+                }
             }
 
             fn local_context(&self) -> LocalContext<'_> {
@@ -176,9 +192,44 @@ impl ComplexSamplesInSlidingFrames {
                         Complex32::zero();
                         self.forward_fft.get_inplace_scratch_len()
                     ],
-                    tone_samples: na::DVector::zeros(self.samples_per_frame),
-                    tone_spectrum: na::DVector::zeros(self.lower_nonconjugate_nrows),
                     tone_spectrum_scaled: na::DVector::zeros(self.lower_nonconjugate_nrows),
+                }
+            }
+
+            #[cfg_attr(feature = "profile", inline(never))]
+            fn tone_bases_init(&mut self) {
+                let mut fft_scratch =
+                    vec![Complex32::zero(); self.forward_fft.get_inplace_scratch_len()];
+                let mut tone_samples = na::DVector::zeros(self.samples_per_frame);
+                let tone = self.tone_generator();
+                for (column_idx, mut tone_spectrum) in
+                    self.tone_spectrums.column_iter_mut().enumerate()
+                {
+                    let frequency = MIN_FREQUENCY + u32::try_from(column_idx).unwrap();
+                    let mut channel = tone(frequency);
+                    tone_samples.apply(|dest| {
+                        let sample = channel.sample_triangle_mono();
+                        channel.step_sample();
+                        *dest = Complex::new(sample, 0.0)
+                    });
+                    self.forward_fft
+                        .process_with_scratch(tone_samples.as_mut_slice(), &mut fft_scratch);
+                    let tone_spectrum_view = tone_samples.rows(0, self.lower_nonconjugate_nrows);
+                    assert_eq!(tone_spectrum.shape(), tone_spectrum_view.shape());
+                    tone_spectrum.zip_apply(&tone_spectrum_view, |dest, src| *dest = src.norm());
+                    {
+                        tone_spectrum[0] *= self.fft_descale;
+                        tone_spectrum
+                            .rows_range_mut(self.conjugate_rows.clone())
+                            .mul_assign(2.0 * self.fft_descale);
+                        if self.samples_per_frame % 2 == 0 {
+                            tone_spectrum[self.lower_nonconjugate_nrows - 1] *= self.fft_descale;
+                        }
+                    }
+                    let original_descale = NotNan::new(tone_spectrum.norm().recip()).unwrap();
+                    tone_spectrum *= original_descale.into_inner();
+                    // ^ we pick the best orthonormal basis of one vector
+                    self.original_descale.push(original_descale);
                 }
             }
         }
@@ -186,8 +237,6 @@ impl ComplexSamplesInSlidingFrames {
         struct LocalContext<'a> {
             cx: &'a Context,
             fft_scratch: Vec<Complex32>,
-            tone_samples: na::DVector<Complex32>,
-            tone_spectrum: na::DVector<f32>,
             tone_spectrum_scaled: na::DVector<f32>,
         }
 
@@ -227,49 +276,28 @@ impl ComplexSamplesInSlidingFrames {
                 frames: na::Matrix<f32, na::Dyn, na::Dyn, na::VecStorage<f32, na::Dyn, na::Dyn>>,
                 best_tones: &mut BestTones,
             ) {
-                for frequency in 20..20000 {
-                    let mut channel = self.cx.tone(frequency);
-                    self.tone_samples.apply(|dest| {
-                        let sample = channel.sample_triangle_mono();
-                        channel.step_sample();
-                        *dest = Complex::new(sample, 0.0)
-                    });
-                    self.cx.forward_fft.process_with_scratch(
-                        self.tone_samples.as_mut_slice(),
-                        &mut self.fft_scratch,
-                    );
-                    let tone_spectrum_view =
-                        self.tone_samples.rows(0, self.cx.lower_nonconjugate_nrows);
-                    assert_eq!(self.tone_spectrum.shape(), tone_spectrum_view.shape());
-                    self.tone_spectrum
-                        .zip_apply(&tone_spectrum_view, |dest, src| *dest = src.norm());
-                    {
-                        self.tone_spectrum[0] *= self.cx.fft_descale;
-                        self.tone_spectrum
-                            .rows_range_mut(self.cx.conjugate_rows.clone())
-                            .mul_assign(2.0 * self.cx.fft_descale);
-                        if self.cx.samples_per_frame % 2 == 0 {
-                            self.tone_spectrum[self.cx.lower_nonconjugate_nrows - 1] *=
-                                self.cx.fft_descale;
-                        }
-                    }
-                    let original_descale = NotNan::new(self.tone_spectrum.norm().recip()).unwrap();
-                    self.tone_spectrum *= original_descale.into_inner();
-                    // ^ we pick the best orthonormal basis of one vector
-
+                for (tone_spectrum_column_idx, (tone_spectrum, original_descale)) in self
+                    .cx
+                    .tone_spectrums
+                    .column_iter()
+                    .zip(&self.cx.original_descale)
+                    .enumerate()
+                {
+                    let frequency =
+                        MIN_FREQUENCY + u32::try_from(tone_spectrum_column_idx).unwrap();
                     for y in 0..frames.ncols() {
                         let frame = frames.column(y);
                         let best_tone = &mut best_tones.frames[y];
 
                         #[cfg(not(target_os = "macos"))]
-                        let scale = frame.dot(&self.tone_spectrum);
+                        let scale = frame.dot(&tone_spectrum);
                         #[cfg(target_os = "macos")]
                         let scale = apple_accelerate::dot_product(
                             frame.as_slice(),
-                            self.tone_spectrum.as_slice(),
+                            tone_spectrum.as_slice(),
                         );
                         let scale = NotNan::new(scale.sqrt()).unwrap();
-                        self.tone_spectrum_scaled.copy_from(&self.tone_spectrum);
+                        self.tone_spectrum_scaled.copy_from(&tone_spectrum);
                         self.tone_spectrum_scaled.scale_mut(scale.into_inner());
 
                         #[cfg(not(target_os = "macos"))]
