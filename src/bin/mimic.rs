@@ -198,39 +198,51 @@ impl ComplexSamplesInSlidingFrames {
 
             #[cfg_attr(feature = "profile", inline(never))]
             fn tone_bases_init(&mut self) {
-                let mut fft_scratch =
-                    vec![Complex32::zero(); self.forward_fft.get_inplace_scratch_len()];
-                let mut tone_samples = na::DVector::zeros(self.samples_per_frame);
                 let tone = self.tone_generator();
-                for (column_idx, mut tone_spectrum) in
-                    self.tone_spectrums.column_iter_mut().enumerate()
-                {
-                    let frequency = MIN_FREQUENCY + u32::try_from(column_idx).unwrap();
-                    let mut channel = tone(frequency);
-                    tone_samples.apply(|dest| {
-                        let sample = channel.sample_triangle_mono();
-                        channel.step_sample();
-                        *dest = Complex::new(sample, 0.0)
-                    });
-                    self.forward_fft
-                        .process_with_scratch(tone_samples.as_mut_slice(), &mut fft_scratch);
-                    let tone_spectrum_view = tone_samples.rows(0, self.lower_nonconjugate_nrows);
-                    assert_eq!(tone_spectrum.shape(), tone_spectrum_view.shape());
-                    tone_spectrum.zip_apply(&tone_spectrum_view, |dest, src| *dest = src.norm());
-                    {
-                        tone_spectrum[0] *= self.fft_descale;
-                        tone_spectrum
-                            .rows_range_mut(self.conjugate_rows.clone())
-                            .mul_assign(2.0 * self.fft_descale);
-                        if self.samples_per_frame % 2 == 0 {
-                            tone_spectrum[self.lower_nonconjugate_nrows - 1] *= self.fft_descale;
-                        }
-                    }
-                    let original_descale = NotNan::new(tone_spectrum.norm().recip()).unwrap();
-                    tone_spectrum *= original_descale.into_inner();
-                    // ^ we pick the best orthonormal basis of one vector
-                    self.original_descale.push(original_descale);
-                }
+                self.original_descale = self
+                    .tone_spectrums
+                    .par_column_iter_mut()
+                    .enumerate()
+                    .map_init(
+                        || {
+                            (
+                                vec![Complex32::zero(); self.forward_fft.get_inplace_scratch_len()],
+                                na::DVector::zeros(self.samples_per_frame),
+                            )
+                        },
+                        |(fft_scratch, tone_samples), (column_idx, mut tone_spectrum)| {
+                            let frequency = MIN_FREQUENCY + u32::try_from(column_idx).unwrap();
+                            let mut channel = tone(frequency);
+                            tone_samples.apply(|dest| {
+                                let sample = channel.sample_triangle_mono();
+                                channel.step_sample();
+                                *dest = Complex::new(sample, 0.0)
+                            });
+                            self.forward_fft
+                                .process_with_scratch(tone_samples.as_mut_slice(), fft_scratch);
+                            let tone_spectrum_view =
+                                tone_samples.rows(0, self.lower_nonconjugate_nrows);
+                            assert_eq!(tone_spectrum.shape(), tone_spectrum_view.shape());
+                            tone_spectrum
+                                .zip_apply(&tone_spectrum_view, |dest, src| *dest = src.norm());
+                            {
+                                tone_spectrum[0] *= self.fft_descale;
+                                tone_spectrum
+                                    .rows_range_mut(self.conjugate_rows.clone())
+                                    .mul_assign(2.0 * self.fft_descale);
+                                if self.samples_per_frame % 2 == 0 {
+                                    tone_spectrum[self.lower_nonconjugate_nrows - 1] *=
+                                        self.fft_descale;
+                                }
+                            }
+                            let original_descale =
+                                NotNan::new(tone_spectrum.norm().recip()).unwrap();
+                            tone_spectrum *= original_descale.into_inner();
+                            // ^ we pick the best orthonormal basis of one vector
+                            original_descale
+                        },
+                    )
+                    .collect();
             }
         }
 
@@ -297,8 +309,17 @@ impl ComplexSamplesInSlidingFrames {
                             tone_spectrum.as_slice(),
                         );
                         let scale = NotNan::new(scale.sqrt()).unwrap();
-                        self.tone_spectrum_scaled.copy_from(&tone_spectrum);
-                        self.tone_spectrum_scaled.scale_mut(scale.into_inner());
+                        #[cfg(target_os = "macos")]
+                        apple_accelerate::scale(
+                            tone_spectrum.as_slice(),
+                            scale.into_inner(),
+                            self.tone_spectrum_scaled.as_mut_slice(),
+                        );
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            self.tone_spectrum_scaled.copy_from(&tone_spectrum);
+                            self.tone_spectrum_scaled.scale_mut(scale.into_inner());
+                        }
 
                         #[cfg(not(target_os = "macos"))]
                         let error = self.tone_spectrum_scaled.metric_distance(&frame);

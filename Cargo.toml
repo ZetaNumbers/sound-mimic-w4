@@ -11,7 +11,7 @@ anyhow = "1.0.79"
 argh = "0.1.12"
 hound = "3.5.1"
 image = "0.24.7"
-nalgebra = "0.32.3"
+nalgebra = { version = "0.32.3", features = ["rayon"] }
 ordered-float = "4.2.0"
 rayon = "1.8.0"
 fft = { package = "rustfft", version = "6.1.0" }
@@ -23,5 +23,5 @@ wt = { package = "wasmtime", version = "16.0.0" }
 apple-accelerate = { git = "https://github.com/zetanumbers/apple-accelerate.git" }
 
 [profile.release]
-# lto = false
+# lto = true
 debug = true
