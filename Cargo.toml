@@ -3,7 +3,9 @@ name = "sound-mimic"
 version = "0.1.0"
 edition = "2021"
 
-# TODO: executables should be able to drop dependencies via features (use required-features) (mention in readme)
+[features]
+profile = []
+
 [dependencies]
 anyhow = "1.0.79"
 argh = "0.1.12"
@@ -17,6 +19,9 @@ tracing = "0.1.40"
 tracing-timing = "0.6.0"
 wt = { package = "wasmtime", version = "16.0.0" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-accelerate = { git = "https://github.com/zetanumbers/apple-accelerate.git" }
+
 [profile.release]
-lto = false
+# lto = false
 debug = true

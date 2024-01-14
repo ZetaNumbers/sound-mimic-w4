@@ -1,4 +1,6 @@
 use std::{
+    fs::File,
+    io::BufReader,
     ops::{MulAssign, Range},
     sync::Arc,
 };
@@ -18,13 +20,22 @@ use sound_mimic::{audio, tone_stream, FRAMERATE};
 /// Chooses most suitable tones for each frame of input sound (wav file)
 /// and outputs these tones as CSV table in stdout.
 #[derive(argh::FromArgs)]
-struct Mimic {}
+struct Mimic {
+    /// input wav file path or `-` to read from stdin
+    #[argh(positional)]
+    wav_file: String,
+}
 
 fn main() {
-    let _args: Mimic = argh::from_env();
+    let args: Mimic = argh::from_env();
 
-    let input = std::io::stdin().lock();
-    let sliding_frames = ComplexSamplesInSlidingFrames::load_from_wav_reader(input);
+    let sliding_frames = if args.wav_file == "-" {
+        ComplexSamplesInSlidingFrames::load_from_wav_reader(std::io::stdin().lock())
+    } else {
+        ComplexSamplesInSlidingFrames::load_from_wav_reader(BufReader::new(
+            File::open(args.wav_file).expect("opening wav file"),
+        ))
+    };
 
     let best_mimic_tones = sliding_frames.pick_best_mimic_tones();
 
@@ -127,7 +138,6 @@ impl ComplexSamplesInSlidingFrames {
         }
     }
 
-    #[inline(never)]
     fn pick_best_mimic_tones(self) -> BestTones {
         struct Context {
             samples_per_frame: usize,
@@ -206,6 +216,17 @@ impl ComplexSamplesInSlidingFrames {
 
                 let mut best_tones = BestTones::new(frames.ncols());
 
+                self.pick_best_mimic_tones_impl(frames, &mut best_tones);
+                best_tones.eval_total_error();
+                best_tones
+            }
+
+            #[cfg_attr(feature = "profile", inline(never))]
+            fn pick_best_mimic_tones_impl(
+                &mut self,
+                frames: na::Matrix<f32, na::Dyn, na::Dyn, na::VecStorage<f32, na::Dyn, na::Dyn>>,
+                best_tones: &mut BestTones,
+            ) {
                 for frequency in 20..20000 {
                     let mut channel = self.cx.tone(frequency);
                     self.tone_samples.apply(|dest| {
@@ -240,12 +261,26 @@ impl ComplexSamplesInSlidingFrames {
                         let frame = frames.column(y);
                         let best_tone = &mut best_tones.frames[y];
 
-                        let scale = NotNan::new(frame.dot(&self.tone_spectrum)).unwrap();
+                        #[cfg(not(target_os = "macos"))]
+                        let scale = frame.dot(&self.tone_spectrum);
+                        #[cfg(target_os = "macos")]
+                        let scale = apple_accelerate::dot_product(
+                            frame.as_slice(),
+                            self.tone_spectrum.as_slice(),
+                        );
+                        let scale = NotNan::new(scale.sqrt()).unwrap();
                         self.tone_spectrum_scaled.copy_from(&self.tone_spectrum);
                         self.tone_spectrum_scaled.scale_mut(scale.into_inner());
 
-                        let error =
-                            NotNan::new(self.tone_spectrum_scaled.metric_distance(&frame)).unwrap();
+                        #[cfg(not(target_os = "macos"))]
+                        let error = self.tone_spectrum_scaled.metric_distance(&frame);
+                        #[cfg(target_os = "macos")]
+                        let error = apple_accelerate::distance_squared(
+                            self.tone_spectrum_scaled.as_slice(),
+                            frame.as_slice(),
+                        )
+                        .sqrt();
+                        let error = NotNan::new(error).unwrap();
 
                         if best_tone.error > error {
                             *best_tone = BestTone {
@@ -256,8 +291,6 @@ impl ComplexSamplesInSlidingFrames {
                         }
                     }
                 }
-                best_tones.eval_total_error();
-                best_tones
             }
         }
 
