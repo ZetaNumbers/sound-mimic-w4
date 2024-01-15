@@ -306,7 +306,7 @@ impl ComplexSamplesInSlidingFrames {
                                         frame.as_slice(),
                                         tone_spectrum.as_slice(),
                                     );
-                                    let scale = NotNan::new(scale.sqrt()).unwrap();
+                                    let scale = NotNan::new(scale).unwrap();
                                     #[cfg(target_os = "macos")]
                                     apple_accelerate::scale(
                                         tone_spectrum.as_slice(),
