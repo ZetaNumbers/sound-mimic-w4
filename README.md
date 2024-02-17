@@ -27,7 +27,7 @@ cargo run --bin record_cartridge_tones -- assets/cartridge.wasm 60
 cargo run --bin record_cartridge_tones -- assets/cartridge.wasm 600 | cargo run --bin tone_playback > assets/cartridge_recording.wav
 
 # save spectrogram of a sound.wav into sound_spectrogram.png
-cat assets/sound.wav | cargo run --bin spectrogram -- png > assets/sound_spectrogram.png
+cat assets/sound.wav | cargo run --bin spectrogram -r -- png -w 800 -h 800 > assets/sound_spectrogram.png
 
 # generate and playback mimic tones of a sound.wav (use `-r` flag to run in release mode)
 cargo run --bin mimic -r -- assets/sound.wav | cargo run --bin tone_playback | vlc --play-and-exit --intf dummy -

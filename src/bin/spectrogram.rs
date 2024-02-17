@@ -1,10 +1,8 @@
 use std::io::Write;
 
-use fft::{
-    num_complex::{Complex, Complex32},
-    FftPlanner,
-};
+use fft::{num_complex::Complex, FftPlanner};
 use image::{imageops, DynamicImage, ImageBuffer};
+use nalgebra as na;
 use sound_mimic::FRAMERATE;
 
 // TODO: switch to render sound amplitude's logarithm instead of sound intencity level
@@ -16,6 +14,17 @@ struct Spectogram {
     /// format of output image using specified extension
     #[argh(positional, from_str_fn(output_image_format_from_extension))]
     image_format: image::ImageFormat,
+
+    #[argh(positional, default = "0.0")]
+    sound_sensitivity: f32,
+
+    /// output image resize width
+    #[argh(option, short = 'w')]
+    width: Option<u32>,
+
+    /// output image resize height
+    #[argh(option, short = 'h')]
+    height: Option<u32>,
 }
 
 fn output_image_format_from_extension(ext: &str) -> Result<image::ImageFormat, String> {
@@ -34,72 +43,59 @@ fn main() {
     assert_eq!(wav_spec.bits_per_sample, 16);
     assert_eq!(wav_spec.sample_format, hound::SampleFormat::Int);
 
-    let width = wav_spec.sample_rate / FRAMERATE;
-    // Eliminate last frame if it's incomplete with integer division
-    let height = wav.len() / width;
-    let half_width = width / 2 + 1;
-
-    let mut input_samples: Vec<_> = wav
+    let width = usize::try_from(wav_spec.sample_rate / FRAMERATE).unwrap();
+    let input_samples: Vec<_> = wav
         .into_samples()
-        .take((height * width) as usize)
         .map(|r| {
             let r: i16 = r.unwrap();
             Complex::from((r as f32) / -(i16::MIN as f32))
         })
         .collect();
 
-    let mut fft = FftPlanner::<f32>::new();
-    fft.plan_fft_forward(width as usize)
-        .process(&mut input_samples);
+    let input_windows = input_samples.windows(width);
+    assert!(width >= 1);
+    let height = input_windows.len();
+    // Since all input samples are on the real axis, one half of
+    // its spectrum should be just a conjugate to other one
+    let half_width = width / 2 + 1;
 
-    let max_normal_reducer = |a: f32, b: f32| {
-        if !a.is_normal() || a <= b {
-            b
-        } else {
-            a
+    let mut fft_planner = FftPlanner::<f32>::new();
+    let fft = fft_planner.plan_fft_forward(width);
+    let mut line = na::DVector::zeros(width);
+    let mut line_scratch = na::DVector::zeros(fft.get_inplace_scratch_len());
+
+    let mut output = na::DMatrix::zeros(half_width, height);
+    assert_eq!(input_windows.len(), height);
+    for (input_window, mut output) in input_windows.zip(output.column_iter_mut()) {
+        line.copy_from_slice(input_window);
+        fft.process_with_scratch(line.as_mut_slice(), line_scratch.as_mut_slice());
+        for (input, output) in line.as_slice()[..half_width].iter().zip(&mut output) {
+            *output = input.norm_sqr();
         }
-    };
-    let spectrums = || {
-        input_samples
-            .chunks(width as usize)
-            .map(|spectrum| &spectrum[..half_width as usize])
-    };
-    let sound_intencity_sqrs = || {
-        spectrums().flat_map(|spectrum| {
-            spectrum
-                .iter()
-                .enumerate()
-                .map(|(f, a)| sound_intencity_sqr(*a, f as f32))
-        })
-    };
+    }
 
-    let sound_sensitivity = std::env::args()
-        .nth(2)
-        .map(|a| {
-            a.parse::<f32>()
-                .expect("Could not parse second argument as sound sensitivity (f32)")
-        })
-        .unwrap_or(0.0)
-        - 8.0;
     let norm_factor = 1.0
-        / (sound_intencity_sqrs()
+        / (output
+            .iter()
+            .copied()
             .reduce(max_normal_reducer)
             .unwrap()
             .log2()
-            + sound_sensitivity);
-    // TODO: use plotters and figure out units
-    let img = ImageBuffer::<image::Luma<_>, _>::from_vec(
-        half_width,
-        height,
-        sound_intencity_sqrs()
-            .map(|sound_intencity| (sound_intencity.log2() + sound_sensitivity) * norm_factor)
-            .map(|l| if l.is_nan() { 0.5 } else { l })
-            .collect(),
-    )
-    .unwrap();
+            + args.sound_sensitivity);
+    output.apply(|sound_aplitude_sqr| {
+        let l = (sound_aplitude_sqr.log2() + args.sound_sensitivity) * norm_factor;
+        *sound_aplitude_sqr = if l.is_nan() { 0.5 } else { l };
+    });
 
-    let img = DynamicImage::from(img).into_rgb8();
-    let width = half_width;
+    let width = half_width.try_into().unwrap();
+    let height = height.try_into().unwrap();
+
+    // TODO: use plotters and figure out units
+
+    let img =
+        ImageBuffer::<image::Luma<_>, _>::from_raw(width, height, output.as_slice().to_owned())
+            .unwrap();
+    let img = DynamicImage::from(img).to_rgb8();
     // let img = imageops::crop_imm(&img, 0, 0, width, height).to_image();
     assert!(img
         .pixels()
@@ -112,7 +108,8 @@ fn main() {
         .count()
         .try_into()
         .unwrap();
-    let img = imageops::crop_imm(
+
+    let mut img = imageops::crop_imm(
         &img,
         0,
         empty_frequencies,
@@ -120,6 +117,14 @@ fn main() {
         width - empty_frequencies,
     )
     .to_image();
+    if args.width.is_some() || args.height.is_some() {
+        img = imageops::resize(
+            &img,
+            args.width.unwrap_or_else(|| img.width()),
+            args.height.unwrap_or_else(|| img.height()),
+            imageops::FilterType::CatmullRom,
+        )
+    }
 
     let mut out_buf = std::io::Cursor::new(Vec::new());
     image::write_buffer_with_format(
@@ -137,6 +142,10 @@ fn main() {
         .expect("writing output image");
 }
 
-fn sound_intencity_sqr(complex_amplitude: Complex32, frequency: f32) -> f32 {
-    complex_amplitude.norm_sqr() * frequency * frequency
+fn max_normal_reducer(a: f32, b: f32) -> f32 {
+    if !a.is_normal() || a <= b {
+        b
+    } else {
+        a
+    }
 }
