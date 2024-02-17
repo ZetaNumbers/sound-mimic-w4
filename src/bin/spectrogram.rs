@@ -25,6 +25,26 @@ struct Spectogram {
     /// output image resize height
     #[argh(option, short = 'h')]
     height: Option<u32>,
+
+    /// output image resize filter type
+    #[argh(
+        option,
+        short = 'f',
+        default = "imageops::FilterType::CatmullRom",
+        from_str_fn(parse_resize_filter)
+    )]
+    filter: imageops::FilterType,
+}
+
+fn parse_resize_filter(s: &str) -> Result<imageops::FilterType, String> {
+    match s {
+        "nearest" => Ok(imageops::FilterType::Nearest),
+        "triangle" => Ok(imageops::FilterType::Triangle),
+        "catmull-rom" => Ok(imageops::FilterType::CatmullRom),
+        "gaussian" => Ok(imageops::FilterType::Gaussian),
+        "lanczos3" => Ok(imageops::FilterType::Lanczos3),
+        other => Err(format!("unsupported resize filter: {other}")),
+    }
 }
 
 fn output_image_format_from_extension(ext: &str) -> Result<image::ImageFormat, String> {
@@ -122,7 +142,7 @@ fn main() {
             &img,
             args.width.unwrap_or_else(|| img.width()),
             args.height.unwrap_or_else(|| img.height()),
-            imageops::FilterType::CatmullRom,
+            args.filter,
         )
     }
 
