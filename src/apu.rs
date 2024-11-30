@@ -214,8 +214,9 @@ impl Apu {
         }
     }
 
-    pub fn write_samples(&mut self, output: &mut [i16]) {
-        for frame in output.chunks_mut(2) {
+    pub fn samples(&mut self) -> impl Iterator<Item = [i16; 2]> + '_ {
+        iter::from_fn(|| {
+            let new_time = self.time.checked_add(1)?;
             let mut mix_left = 0;
             let mut mix_right = 0;
             for (channel, channel_addend) in self.channels.iter_mut() {
@@ -285,10 +286,9 @@ impl Apu {
                     }
                 }
             }
-            frame[0] = mix_left;
-            frame[1] = mix_right;
-            self.time = self.time.checked_add(1).expect("APU time overflow");
-        }
+            self.time = new_time;
+            Some([mix_left, mix_right])
+        })
     }
 }
 
