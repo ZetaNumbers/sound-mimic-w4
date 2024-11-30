@@ -213,82 +213,83 @@ impl Apu {
             _ => (),
         }
     }
+}
 
-    pub fn samples(&mut self) -> impl Iterator<Item = [i16; 2]> + '_ {
-        iter::from_fn(|| {
-            let new_time = self.time.checked_add(1)?;
-            let mut mix_left = 0;
-            let mut mix_right = 0;
-            for (channel, channel_addend) in self.channels.iter_mut() {
-                if self.time < channel.release_time || self.ticks == channel.end_tick {
-                    let freq = channel.get_current_frequency(self.time);
-                    let volume = channel.get_current_volume(self.time);
-                    let sample;
-                    match channel_addend {
-                        ChannelAddendMut::Noise(channel_addend) => {
-                            channel.phase += freq * freq / (1000000.0f32 / 44100. * 44100.);
-                            while channel.phase > 0. {
-                                channel.phase -= 1.;
-                                channel_addend.seed = (channel_addend.seed as i32
-                                    ^ channel_addend.seed as i32 >> 7_i32)
-                                    as u16;
-                                channel_addend.seed = (channel_addend.seed as i32
-                                    ^ (channel_addend.seed as i32) << 9_i32)
-                                    as u16;
-                                channel_addend.seed = (channel_addend.seed as i32
-                                    ^ channel_addend.seed as i32 >> 13_i32)
-                                    as u16;
-                                channel_addend.last_random =
-                                    (2_i32 * (channel_addend.seed as i32 & 0x1_i32) - 1_i32) as i16;
-                            }
-                            sample = (volume as i32 * channel_addend.last_random as i32) as i16;
+impl Iterator for Apu {
+    type Item = [i16; 2];
+
+    fn next(&mut self) -> Option<[i16; 2]> {
+        let new_time = self.time.checked_add(1)?;
+        let mut mix_left = 0;
+        let mut mix_right = 0;
+        for (channel, channel_addend) in self.channels.iter_mut() {
+            if self.time < channel.release_time || self.ticks == channel.end_tick {
+                let freq = channel.get_current_frequency(self.time);
+                let volume = channel.get_current_volume(self.time);
+                let sample;
+                match channel_addend {
+                    ChannelAddendMut::Noise(channel_addend) => {
+                        channel.phase += freq * freq / (1000000.0f32 / 44100. * 44100.);
+                        while channel.phase > 0. {
+                            channel.phase -= 1.;
+                            channel_addend.seed = (channel_addend.seed as i32
+                                ^ channel_addend.seed as i32 >> 7_i32)
+                                as u16;
+                            channel_addend.seed = (channel_addend.seed as i32
+                                ^ (channel_addend.seed as i32) << 9_i32)
+                                as u16;
+                            channel_addend.seed = (channel_addend.seed as i32
+                                ^ channel_addend.seed as i32 >> 13_i32)
+                                as u16;
+                            channel_addend.last_random =
+                                (2_i32 * (channel_addend.seed as i32 & 0x1_i32) - 1_i32) as i16;
                         }
-                        _ => {
-                            let phase_inc = freq / 44100.;
-                            channel.phase += phase_inc;
-                            if channel.phase >= 1. {
-                                channel.phase -= 1.;
-                            }
-                            match channel_addend {
-                                ChannelAddendMut::Pulse(channel_addend) => {
-                                    let duty_phase;
-                                    let duty_phase_inc;
-                                    let multiplier;
-                                    if channel.phase < channel_addend.duty_cycle {
-                                        duty_phase = channel.phase / channel_addend.duty_cycle;
-                                        duty_phase_inc = phase_inc / channel_addend.duty_cycle;
-                                        multiplier = volume;
-                                    } else {
-                                        duty_phase = (channel.phase - channel_addend.duty_cycle)
-                                            / (1.0f32 - channel_addend.duty_cycle);
-                                        duty_phase_inc =
-                                            phase_inc / (1.0f32 - channel_addend.duty_cycle);
-                                        multiplier = -(volume as i32) as i16;
-                                    }
-                                    sample = (multiplier as f32
-                                        * polyblep(duty_phase, duty_phase_inc))
-                                        as i16;
-                                }
-                                ChannelAddendMut::Triangle => {
-                                    sample = (volume as f32
-                                        * (2. * (2. * channel.phase - 1.).abs() - 1.))
-                                        as i16;
-                                }
-                                ChannelAddendMut::Noise(_) => unreachable!(),
-                            }
+                        sample = (volume as i32 * channel_addend.last_random as i32) as i16;
+                    }
+                    _ => {
+                        let phase_inc = freq / 44100.;
+                        channel.phase += phase_inc;
+                        if channel.phase >= 1. {
+                            channel.phase -= 1.;
                         }
-                    }
-                    if channel.pan as i32 != 1_i32 {
-                        mix_right = (mix_right as i32 + sample as i32) as i16;
-                    }
-                    if channel.pan as i32 != 2_i32 {
-                        mix_left = (mix_left as i32 + sample as i32) as i16;
+                        match channel_addend {
+                            ChannelAddendMut::Pulse(channel_addend) => {
+                                let duty_phase;
+                                let duty_phase_inc;
+                                let multiplier;
+                                if channel.phase < channel_addend.duty_cycle {
+                                    duty_phase = channel.phase / channel_addend.duty_cycle;
+                                    duty_phase_inc = phase_inc / channel_addend.duty_cycle;
+                                    multiplier = volume;
+                                } else {
+                                    duty_phase = (channel.phase - channel_addend.duty_cycle)
+                                        / (1.0f32 - channel_addend.duty_cycle);
+                                    duty_phase_inc =
+                                        phase_inc / (1.0f32 - channel_addend.duty_cycle);
+                                    multiplier = -(volume as i32) as i16;
+                                }
+                                sample = (multiplier as f32 * polyblep(duty_phase, duty_phase_inc))
+                                    as i16;
+                            }
+                            ChannelAddendMut::Triangle => {
+                                sample = (volume as f32
+                                    * (2. * (2. * channel.phase - 1.).abs() - 1.))
+                                    as i16;
+                            }
+                            ChannelAddendMut::Noise(_) => unreachable!(),
+                        }
                     }
                 }
+                if channel.pan as i32 != 1_i32 {
+                    mix_right = (mix_right as i32 + sample as i32) as i16;
+                }
+                if channel.pan as i32 != 2_i32 {
+                    mix_left = (mix_left as i32 + sample as i32) as i16;
+                }
             }
-            self.time = new_time;
-            Some([mix_left, mix_right])
-        })
+        }
+        self.time = new_time;
+        Some([mix_left, mix_right])
     }
 }
 
