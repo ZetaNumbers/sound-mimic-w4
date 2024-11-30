@@ -299,29 +299,38 @@ impl ComplexSamplesInSlidingFrames {
                                 MIN_FREQUENCY + u32::try_from(tone_spectrum_column_idx).unwrap();
                             frames.column_iter().zip(&mut best_tones.frames).for_each(
                                 |(frame, best_tone)| {
-                                    #[cfg(not(target_os = "macos"))]
+                                    #[cfg(not(all(
+                                        target_os = "macos",
+                                        feature = "apple-accelerate"
+                                    )))]
                                     let scale = frame.dot(&tone_spectrum);
-                                    #[cfg(target_os = "macos")]
+                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
                                     let scale = apple_accelerate::dot_product(
                                         frame.as_slice(),
                                         tone_spectrum.as_slice(),
                                     );
                                     let scale = NotNan::new(scale).unwrap();
-                                    #[cfg(target_os = "macos")]
+                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
                                     apple_accelerate::scale(
                                         tone_spectrum.as_slice(),
                                         scale.into_inner(),
                                         self.tone_spectrum_scaled.as_mut_slice(),
                                     );
-                                    #[cfg(not(target_os = "macos"))]
+                                    #[cfg(not(all(
+                                        target_os = "macos",
+                                        feature = "apple-accelerate"
+                                    )))]
                                     {
                                         self.tone_spectrum_scaled.copy_from(&tone_spectrum);
                                         self.tone_spectrum_scaled.scale_mut(scale.into_inner());
                                     }
 
-                                    #[cfg(not(target_os = "macos"))]
+                                    #[cfg(not(all(
+                                        target_os = "macos",
+                                        feature = "apple-accelerate"
+                                    )))]
                                     let error = self.tone_spectrum_scaled.metric_distance(&frame);
-                                    #[cfg(target_os = "macos")]
+                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
                                     let error = apple_accelerate::distance_squared(
                                         self.tone_spectrum_scaled.as_slice(),
                                         frame.as_slice(),
