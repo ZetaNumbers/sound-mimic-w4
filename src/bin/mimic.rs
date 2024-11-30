@@ -13,7 +13,7 @@ use fft::{
 use nalgebra as na;
 use ordered_float::NotNan;
 use rayon::prelude::*;
-use sound_mimic::{audio, tone_stream, FRAMERATE};
+use sound_mimic::{apu, tone_stream, Apu, FRAMERATE};
 
 const MIN_FREQUENCY: u32 = 20;
 const MAX_FREQUENCY: u32 = 20000;
@@ -46,7 +46,7 @@ fn main() {
     for tone in &best_mimic_tones.frames {
         let volume = (100.0 * tone.scale.into_inner()).clamp(0.0, 100.0).trunc() as u32;
         writer
-            .write_tone(tone.frequency, 1, volume, audio::TRIANGLE_CHANNEL)
+            .write_tone(tone.frequency, 1, volume, apu::TRIANGLE_CHANNEL_FLAG)
             .unwrap();
         writer.step_frame().unwrap();
     }
@@ -98,6 +98,13 @@ impl BestTones {
         let scale = max_scale.recip();
         self.frames.iter_mut().for_each(|t| t.scale *= scale);
     }
+}
+
+fn tone(apu: &mut Apu, frequency: u32, dest: &mut [Complex32]) {
+    debug_assert_eq!(dest.len() * 60, usize::try_from(apu.sample_rate()).unwrap());
+    apu.tone(frequency, 1, 100, apu::TRIANGLE_CHANNEL_FLAG);
+    dest.fill_with(|| (apu.next().unwrap()[0] as f32 / u16::MAX as f32).into());
+    apu.tick();
 }
 
 /// Gets every possible frame offset to pick the best candidate.
@@ -172,19 +179,6 @@ impl ComplexSamplesInSlidingFrames {
                 out
             }
 
-            fn tone_generator(&self) -> impl Fn(u32) -> audio::Channel {
-                let samples_per_frame = self.samples_per_frame;
-                move |frequency| {
-                    audio::Channel::new(
-                        samples_per_frame as u32 * FRAMERATE,
-                        frequency,
-                        1,
-                        100,
-                        audio::PULSE1_CHANNEL,
-                    )
-                }
-            }
-
             fn local_context(&self) -> LocalContext<'_> {
                 LocalContext {
                     cx: self,
@@ -198,7 +192,6 @@ impl ComplexSamplesInSlidingFrames {
 
             #[cfg_attr(feature = "profile", inline(never))]
             fn tone_bases_init(&mut self) {
-                let tone = self.tone_generator();
                 self.original_descale = self
                     .tone_spectrums
                     .par_column_iter_mut()
@@ -208,16 +201,12 @@ impl ComplexSamplesInSlidingFrames {
                             (
                                 vec![Complex32::zero(); self.forward_fft.get_inplace_scratch_len()],
                                 na::DVector::zeros(self.samples_per_frame),
+                                Apu::new(self.samples_per_frame as u32 * FRAMERATE),
                             )
                         },
-                        |(fft_scratch, tone_samples), (column_idx, mut tone_spectrum)| {
+                        |(fft_scratch, tone_samples, apu), (column_idx, mut tone_spectrum)| {
                             let frequency = MIN_FREQUENCY + u32::try_from(column_idx).unwrap();
-                            let mut channel = tone(frequency);
-                            tone_samples.apply(|dest| {
-                                let sample = channel.sample_triangle_mono();
-                                channel.step_sample();
-                                *dest = Complex::new(sample, 0.0)
-                            });
+                            tone(apu, frequency, tone_samples.as_mut_slice());
                             self.forward_fft
                                 .process_with_scratch(tone_samples.as_mut_slice(), fft_scratch);
                             let tone_spectrum_view =
