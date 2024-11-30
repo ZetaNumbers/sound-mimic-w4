@@ -41,11 +41,11 @@ pub struct Apu {
 }
 
 fn lerp(value1: i32, value2: i32, t: f32) -> i32 {
-    return (value1 as f32 + t * (value2 - value1) as f32) as i32;
+    (value1 as f32 + t * (value2 - value1) as f32) as i32
 }
 
 fn lerpf(value1: f32, value2: f32, t: f32) -> f32 {
-    return value1 + t * (value2 - value1);
+    value1 + t * (value2 - value1)
 }
 
 fn ramp(time: u64, value1: i32, value2: i32, time1: u64, time2: u64) -> i32 {
@@ -53,7 +53,7 @@ fn ramp(time: u64, value1: i32, value2: i32, time1: u64, time2: u64) -> i32 {
         return value2;
     }
     let t: f32 = time.wrapping_sub(time1) as f32 / time2.wrapping_sub(time1) as f32;
-    return lerp(value1, value2, t);
+    lerp(value1, value2, t)
 }
 
 fn rampf(time: u64, value1: f32, value2: f32, time1: u64, time2: u64) -> f32 {
@@ -61,23 +61,29 @@ fn rampf(time: u64, value1: f32, value2: f32, time1: u64, time2: u64) -> f32 {
         return value2;
     }
     let t: f32 = time.wrapping_sub(time1) as f32 / time2.wrapping_sub(time1) as f32;
-    return lerpf(value1, value2, t);
+    lerpf(value1, value2, t)
 }
 
 fn polyblep(phase: f32, phase_inc: f32) -> f32 {
     if phase < phase_inc {
         let t: f32 = phase / phase_inc;
-        return t + t - t * t;
+        t + t - t * t
     } else if phase > 1.0f32 - phase_inc {
         let t_0: f32 = (phase - (1.0f32 - phase_inc)) / phase_inc;
         return 1.0f32 - (t_0 + t_0 - t_0 * t_0);
     } else {
         return 1.0f32;
-    };
+    }
 }
 
 fn midi_freq(note: u8, bend: u8) -> f32 {
-    return 2.0f32.powf((note as f32 - 69.0f32 + bend as f32 / 256.0f32) / 12.0f32) * 440.0f32;
+    2.0f32.powf((note as f32 - 69.0f32 + bend as f32 / 256.0f32) / 12.0f32) * 440.0f32
+}
+
+impl Default for Apu {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Apu {
@@ -142,10 +148,10 @@ impl Apu {
         }
         if note_mode != 0 {
             channel.freq1 = midi_freq(freq1 as u8, (freq1 >> 8) as u8);
-            channel.freq2 = if freq2 == 0 as i32 {
+            channel.freq2 = if freq2 == 0_i32 {
                 0.
             } else {
-                midi_freq((freq2 & 0xff as i32) as u8, (freq2 >> 8 as i32) as u8)
+                midi_freq((freq2 & 0xff_i32) as u8, (freq2 >> 8_i32) as u8)
             };
         } else {
             channel.freq1 = freq1 as f32;
@@ -153,13 +159,13 @@ impl Apu {
         }
         channel.start_time = self.time;
         channel.attack_time =
-            (channel.start_time).wrapping_add((44100 as i32 * attack / 60 as i32) as u64);
+            (channel.start_time).wrapping_add((44100_i32 * attack / 60_i32) as u64);
         channel.decay_time =
-            (channel.attack_time).wrapping_add((44100 as i32 * decay / 60 as i32) as u64);
+            (channel.attack_time).wrapping_add((44100_i32 * decay / 60_i32) as u64);
         channel.sustain_time =
-            (channel.decay_time).wrapping_add((44100 as i32 * sustain / 60 as i32) as u64);
+            (channel.decay_time).wrapping_add((44100_i32 * sustain / 60_i32) as u64);
         channel.release_time =
-            (channel.sustain_time).wrapping_add((44100 as i32 * release / 60 as i32) as u64);
+            (channel.sustain_time).wrapping_add((44100_i32 * release / 60_i32) as u64);
         channel.end_tick = self
             .ticks
             .wrapping_add(attack as u64)
@@ -167,9 +173,9 @@ impl Apu {
             .wrapping_add(sustain as u64)
             .wrapping_add(release as u64);
         let max_volume = if channel_idx == 2 { 0x2000_i16 } else { 0x1333 };
-        channel.sustain_volume = (max_volume as i32 * sustain_volume / 100 as i32) as i16;
+        channel.sustain_volume = (max_volume as i32 * sustain_volume / 100_i32) as i16;
         channel.peak_volume = if peak_volume != 0 {
-            (max_volume as i32 * peak_volume / 100 as i32) as i16
+            (max_volume as i32 * peak_volume / 100_i32) as i16
         } else {
             max_volume
         };
@@ -186,11 +192,9 @@ impl Apu {
                     channel.addend.pulse.duty_cycle = 0.25f32;
                 }
             }
-        } else if channel_idx == 2 {
-            if release == 0 as i32 {
-                channel.release_time =
-                    (channel.release_time).wrapping_add((44100 as i32 / 1000 as i32) as u64);
-            }
+        } else if channel_idx == 2 && release == 0_i32 {
+            channel.release_time =
+                (channel.release_time).wrapping_add((44100_i32 / 1000_i32) as u64);
         }
     }
 
@@ -210,17 +214,17 @@ impl Apu {
                             channel.phase -= 1.;
                             channel.phase;
                             channel.addend.noise.seed = (channel.addend.noise.seed as i32
-                                ^ channel.addend.noise.seed as i32 >> 7 as i32)
+                                ^ channel.addend.noise.seed as i32 >> 7_i32)
                                 as u16;
                             channel.addend.noise.seed = (channel.addend.noise.seed as i32
-                                ^ (channel.addend.noise.seed as i32) << 9 as i32)
+                                ^ (channel.addend.noise.seed as i32) << 9_i32)
                                 as u16;
                             channel.addend.noise.seed = (channel.addend.noise.seed as i32
-                                ^ channel.addend.noise.seed as i32 >> 13 as i32)
+                                ^ channel.addend.noise.seed as i32 >> 13_i32)
                                 as u16;
                             channel.addend.noise.last_random =
-                                (2 as i32 * (channel.addend.noise.seed as i32 & 0x1 as i32)
-                                    - 1 as i32) as i16;
+                                (2_i32 * (channel.addend.noise.seed as i32 & 0x1_i32)
+                                    - 1_i32) as i16;
                         }
                         sample = (volume as i32 * channel.addend.noise.last_random as i32) as i16;
                     } else {
@@ -252,10 +256,10 @@ impl Apu {
                                 (multiplier as f32 * polyblep(duty_phase, duty_phase_inc)) as i16;
                         }
                     }
-                    if channel.pan as i32 != 1 as i32 {
+                    if channel.pan as i32 != 1_i32 {
                         mix_right = (mix_right as i32 + sample as i32) as i16;
                     }
-                    if channel.pan as i32 != 2 as i32 {
+                    if channel.pan as i32 != 2_i32 {
                         mix_left = (mix_left as i32 + sample as i32) as i16;
                     }
                 }
@@ -285,12 +289,12 @@ impl Channel {
     fn get_current_volume(&self, time: u64) -> i16 {
         if time >= self.sustain_time
             && (self.release_time).wrapping_sub(self.sustain_time)
-                > (44100 as i32 / 1000 as i32) as u64
+                > (44100_i32 / 1000_i32) as u64
         {
             ramp(
                 time,
                 self.sustain_volume as i32,
-                0 as i32,
+                0_i32,
                 self.sustain_time,
                 self.release_time,
             ) as i16
@@ -307,7 +311,7 @@ impl Channel {
         } else {
             ramp(
                 time,
-                0 as i32,
+                0_i32,
                 self.peak_volume as i32,
                 self.start_time,
                 self.attack_time,
