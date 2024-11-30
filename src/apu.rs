@@ -70,9 +70,9 @@ fn polyblep(phase: f32, phase_inc: f32) -> f32 {
         t + t - t * t
     } else if phase > 1.0f32 - phase_inc {
         let t_0: f32 = (phase - (1.0f32 - phase_inc)) / phase_inc;
-        return 1.0f32 - (t_0 + t_0 - t_0 * t_0);
+        1.0f32 - (t_0 + t_0 - t_0 * t_0)
     } else {
-        return 1.0f32;
+        1.0f32
     }
 }
 
@@ -130,18 +130,18 @@ impl Apu {
     }
 
     pub fn tone(&mut self, frequency: i32, duration: i32, volume: i32, flags: i32) {
-        let freq1: i32 = frequency & 0xffff;
-        let freq2: i32 = frequency >> 16 & 0xffff;
-        let sustain: i32 = duration & 0xff;
-        let release: i32 = duration >> 8 & 0xff;
-        let decay: i32 = duration >> 16 & 0xff;
-        let attack: i32 = duration >> 24 & 0xff;
-        let sustain_volume: i32 = min(volume & 0xff, 100);
-        let peak_volume: i32 = min(volume >> 8 & 0xff, 100);
+        let freq1 = frequency & 0xffff;
+        let freq2 = frequency >> 16 & 0xffff;
+        let sustain = duration & 0xff;
+        let release = duration >> 8 & 0xff;
+        let decay = duration >> 16 & 0xff;
+        let attack = duration >> 24 & 0xff;
+        let sustain_volume = min(volume & 0xff, 100);
+        let peak_volume = min(volume >> 8 & 0xff, 100);
         let channel_idx = (flags & 0x3) as usize;
-        let mode: i32 = flags >> 2 & 0x3;
-        let pan: i32 = flags >> 4 & 0x3;
-        let note_mode: i32 = flags & 0x40;
+        let mode = flags >> 2 & 0x3;
+        let pan = flags >> 4 & 0x3;
+        let note_mode = flags & 0x40;
         let channel = &mut self.channels[channel_idx];
         if self.time > channel.release_time && self.ticks != channel.end_tick {
             channel.phase = (if channel_idx == 2 { 0.25f64 } else { 0. }) as f32;
@@ -188,9 +188,10 @@ impl Apu {
                 2 => {
                     channel.addend.pulse.duty_cycle = 0.5f32;
                 }
-                1 | 3 | _ => {
+                1 | 3 => {
                     channel.addend.pulse.duty_cycle = 0.25f32;
                 }
+                _ => unreachable!(),
             }
         } else if channel_idx == 2 && release == 0_i32 {
             channel.release_time =
@@ -212,7 +213,6 @@ impl Apu {
                         channel.phase += freq * freq / (1000000.0f32 / 44100. * 44100.);
                         while channel.phase > 0. {
                             channel.phase -= 1.;
-                            channel.phase;
                             channel.addend.noise.seed = (channel.addend.noise.seed as i32
                                 ^ channel.addend.noise.seed as i32 >> 7_i32)
                                 as u16;
@@ -223,8 +223,8 @@ impl Apu {
                                 ^ channel.addend.noise.seed as i32 >> 13_i32)
                                 as u16;
                             channel.addend.noise.last_random =
-                                (2_i32 * (channel.addend.noise.seed as i32 & 0x1_i32)
-                                    - 1_i32) as i16;
+                                (2_i32 * (channel.addend.noise.seed as i32 & 0x1_i32) - 1_i32)
+                                    as i16;
                         }
                         sample = (volume as i32 * channel.addend.noise.last_random as i32) as i16;
                     } else {
@@ -232,7 +232,6 @@ impl Apu {
                         channel.phase += phase_inc;
                         if channel.phase >= 1. {
                             channel.phase -= 1.;
-                            channel.phase;
                         }
                         if channel_idx == 2 {
                             sample = (volume as f32 * (2. * (2. * channel.phase - 1.).abs() - 1.))
@@ -288,8 +287,7 @@ impl Channel {
 
     fn get_current_volume(&self, time: u64) -> i16 {
         if time >= self.sustain_time
-            && (self.release_time).wrapping_sub(self.sustain_time)
-                > (44100_i32 / 1000_i32) as u64
+            && (self.release_time).wrapping_sub(self.sustain_time) > (44100_i32 / 1000_i32) as u64
         {
             ramp(
                 time,
