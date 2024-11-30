@@ -2,6 +2,13 @@ use std::{cmp::min, iter};
 
 pub const PAN_LEFT_FLAG: u32 = 16;
 pub const PAN_RIGHT_FLAG: u32 = 32;
+pub const PAN_FLAG_BIT_OFFSET: u32 = 4;
+
+pub const PULSE1_CHANNEL_FLAG: u32 = 0;
+pub const PULSE2_CHANNEL_FLAG: u32 = 1;
+pub const TRIANGLE_CHANNEL_FLAG: u32 = 2;
+pub const NOISE_CHANNEL_FLAG: u32 = 3;
+pub const CHANNEL_FLAG_BIT_OFFSET: u32 = 0;
 
 #[derive(Clone, Copy)]
 pub struct Durations {
@@ -197,6 +204,10 @@ impl Apu {
 
     pub fn tick(&mut self) {
         self.ticks = self.ticks.checked_add(1).expect("APU tick overflow");
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
     }
 
     pub fn tone(&mut self, frequency: u32, duration: u32, volume: u32, flags: u32) {
