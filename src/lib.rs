@@ -1,9 +1,8 @@
-pub use crate::{apu::Apu, audio::Audio, cartridge::Cartridge};
+pub use crate::{apu::Apu, cartridge::Cartridge};
 
 pub const FRAMERATE: u32 = 60;
 
-mod apu;
-pub mod audio;
+pub mod apu;
 pub mod cartridge;
 pub mod tone_stream;
 pub mod utils;
