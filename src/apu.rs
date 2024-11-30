@@ -1,24 +1,33 @@
-use std::cmp::min;
+use std::{cmp::min, iter};
 
-#[derive(Copy, Clone)]
+#[derive(Clone, Copy)]
 struct NoiseAddend {
     seed: u16,
     last_random: i16,
 }
 
-#[derive(Copy, Clone)]
-union Addend {
-    pulse: PulseAddend,
-    noise: NoiseAddend,
+impl Default for NoiseAddend {
+    fn default() -> Self {
+        NoiseAddend {
+            seed: 0x1,
+            last_random: 0,
+        }
+    }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone, Copy, Default)]
 struct PulseAddend {
     duty_cycle: f32,
 }
 
-#[derive(Copy, Clone)]
-struct Channel {
+enum ChannelAddendMut<'a> {
+    Pulse(&'a mut PulseAddend),
+    Triangle,
+    Noise(&'a mut NoiseAddend),
+}
+
+#[derive(Default)]
+struct GeneralChannel {
     freq1: f32,
     freq2: f32,
     start_time: u64,
@@ -31,11 +40,55 @@ struct Channel {
     peak_volume: i16,
     phase: f32,
     pan: u8,
-    addend: Addend,
 }
 
+#[derive(Default)]
+struct Channel<A> {
+    general: GeneralChannel,
+    addend: A,
+}
+
+#[derive(Default)]
+struct Channels {
+    pulse: [Channel<PulseAddend>; 2],
+    triangle: Channel<()>,
+    noise: Channel<NoiseAddend>,
+}
+
+impl Channels {
+    fn get_mut(&mut self, idx: usize) -> Option<(&mut GeneralChannel, ChannelAddendMut<'_>)> {
+        match idx {
+            0 | 1 => {
+                let c = &mut self.pulse[idx];
+                Some((&mut c.general, ChannelAddendMut::Pulse(&mut c.addend)))
+            }
+            2 => Some((&mut self.triangle.general, ChannelAddendMut::Triangle)),
+            3 => Some((
+                &mut self.noise.general,
+                ChannelAddendMut::Noise(&mut self.noise.addend),
+            )),
+            _ => None,
+        }
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (&mut GeneralChannel, ChannelAddendMut<'_>)> {
+        self.pulse
+            .iter_mut()
+            .map(|c| (&mut c.general, ChannelAddendMut::Pulse(&mut c.addend)))
+            .chain(iter::once((
+                &mut self.triangle.general,
+                ChannelAddendMut::Triangle,
+            )))
+            .chain(iter::once((
+                &mut self.noise.general,
+                ChannelAddendMut::Noise(&mut self.noise.addend),
+            )))
+    }
+}
+
+#[derive(Default)]
 pub struct Apu {
-    channels: [Channel; 4],
+    channels: Channels,
     time: u64,
     ticks: u64,
 }
@@ -80,49 +133,9 @@ fn midi_freq(note: u8, bend: u8) -> f32 {
     2.0f32.powf((note as f32 - 69.0f32 + bend as f32 / 256.0f32) / 12.0f32) * 440.0f32
 }
 
-impl Default for Apu {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Apu {
     pub fn new() -> Apu {
-        let init = Channel {
-            freq1: 0.,
-            freq2: 0.,
-            start_time: 0,
-            attack_time: 0,
-            decay_time: 0,
-            sustain_time: 0,
-            release_time: 0,
-            end_tick: 0,
-            sustain_volume: 0,
-            peak_volume: 0,
-            phase: 0.,
-            pan: 0,
-            addend: Addend {
-                pulse: PulseAddend { duty_cycle: 0. },
-            },
-        };
-        Apu {
-            channels: [
-                init,
-                init,
-                init,
-                Channel {
-                    addend: Addend {
-                        noise: NoiseAddend {
-                            seed: 0x1,
-                            last_random: 0,
-                        },
-                    },
-                    ..init
-                },
-            ],
-            time: 0,
-            ticks: 0,
-        }
+        Apu::default()
     }
 
     pub fn tick(&mut self) {
@@ -142,7 +155,7 @@ impl Apu {
         let mode = flags >> 2 & 0x3;
         let pan = flags >> 4 & 0x3;
         let note_mode = flags & 0x40;
-        let channel = &mut self.channels[channel_idx];
+        let (channel, channel_addend) = self.channels.get_mut(channel_idx).unwrap();
         if self.time > channel.release_time && self.ticks != channel.end_tick {
             channel.phase = (if channel_idx == 2 { 0.25f64 } else { 0. }) as f32;
         }
@@ -180,79 +193,88 @@ impl Apu {
             max_volume
         };
         channel.pan = pan as u8;
-        if channel_idx == 0 || channel_idx == 1 {
-            match mode {
+        match channel_addend {
+            ChannelAddendMut::Pulse(channel_addend) => match mode {
                 0 => {
-                    channel.addend.pulse.duty_cycle = 0.125f32;
+                    channel_addend.duty_cycle = 0.125f32;
                 }
                 2 => {
-                    channel.addend.pulse.duty_cycle = 0.5f32;
+                    channel_addend.duty_cycle = 0.5f32;
                 }
                 1 | 3 => {
-                    channel.addend.pulse.duty_cycle = 0.25f32;
+                    channel_addend.duty_cycle = 0.25f32;
                 }
                 _ => unreachable!(),
+            },
+            ChannelAddendMut::Triangle if release == 0_i32 => {
+                channel.release_time =
+                    (channel.release_time).wrapping_add((44100_i32 / 1000_i32) as u64);
             }
-        } else if channel_idx == 2 && release == 0_i32 {
-            channel.release_time =
-                (channel.release_time).wrapping_add((44100_i32 / 1000_i32) as u64);
+            _ => (),
         }
     }
 
-    pub unsafe fn write_samples(&mut self, output: &mut [i16]) {
+    pub fn write_samples(&mut self, output: &mut [i16]) {
         for frame in output.chunks_mut(2) {
             let mut mix_left = 0;
             let mut mix_right = 0;
-            for channel_idx in 0..4 {
-                let channel = &mut self.channels[channel_idx];
+            for (channel, channel_addend) in self.channels.iter_mut() {
                 if self.time < channel.release_time || self.ticks == channel.end_tick {
                     let freq = channel.get_current_frequency(self.time);
                     let volume = channel.get_current_volume(self.time);
                     let sample;
-                    if channel_idx == 3 {
-                        channel.phase += freq * freq / (1000000.0f32 / 44100. * 44100.);
-                        while channel.phase > 0. {
-                            channel.phase -= 1.;
-                            channel.addend.noise.seed = (channel.addend.noise.seed as i32
-                                ^ channel.addend.noise.seed as i32 >> 7_i32)
-                                as u16;
-                            channel.addend.noise.seed = (channel.addend.noise.seed as i32
-                                ^ (channel.addend.noise.seed as i32) << 9_i32)
-                                as u16;
-                            channel.addend.noise.seed = (channel.addend.noise.seed as i32
-                                ^ channel.addend.noise.seed as i32 >> 13_i32)
-                                as u16;
-                            channel.addend.noise.last_random =
-                                (2_i32 * (channel.addend.noise.seed as i32 & 0x1_i32) - 1_i32)
-                                    as i16;
-                        }
-                        sample = (volume as i32 * channel.addend.noise.last_random as i32) as i16;
-                    } else {
-                        let phase_inc: f32 = freq / 44100.;
-                        channel.phase += phase_inc;
-                        if channel.phase >= 1. {
-                            channel.phase -= 1.;
-                        }
-                        if channel_idx == 2 {
-                            sample = (volume as f32 * (2. * (2. * channel.phase - 1.).abs() - 1.))
-                                as i16;
-                        } else {
-                            let duty_phase;
-                            let duty_phase_inc;
-                            let multiplier;
-                            if channel.phase < channel.addend.pulse.duty_cycle {
-                                duty_phase = channel.phase / channel.addend.pulse.duty_cycle;
-                                duty_phase_inc = phase_inc / channel.addend.pulse.duty_cycle;
-                                multiplier = volume;
-                            } else {
-                                duty_phase = (channel.phase - channel.addend.pulse.duty_cycle)
-                                    / (1.0f32 - channel.addend.pulse.duty_cycle);
-                                duty_phase_inc =
-                                    phase_inc / (1.0f32 - channel.addend.pulse.duty_cycle);
-                                multiplier = -(volume as i32) as i16;
+                    match channel_addend {
+                        ChannelAddendMut::Noise(channel_addend) => {
+                            channel.phase += freq * freq / (1000000.0f32 / 44100. * 44100.);
+                            while channel.phase > 0. {
+                                channel.phase -= 1.;
+                                channel_addend.seed = (channel_addend.seed as i32
+                                    ^ channel_addend.seed as i32 >> 7_i32)
+                                    as u16;
+                                channel_addend.seed = (channel_addend.seed as i32
+                                    ^ (channel_addend.seed as i32) << 9_i32)
+                                    as u16;
+                                channel_addend.seed = (channel_addend.seed as i32
+                                    ^ channel_addend.seed as i32 >> 13_i32)
+                                    as u16;
+                                channel_addend.last_random =
+                                    (2_i32 * (channel_addend.seed as i32 & 0x1_i32) - 1_i32) as i16;
                             }
-                            sample =
-                                (multiplier as f32 * polyblep(duty_phase, duty_phase_inc)) as i16;
+                            sample = (volume as i32 * channel_addend.last_random as i32) as i16;
+                        }
+                        _ => {
+                            let phase_inc = freq / 44100.;
+                            channel.phase += phase_inc;
+                            if channel.phase >= 1. {
+                                channel.phase -= 1.;
+                            }
+                            match channel_addend {
+                                ChannelAddendMut::Pulse(channel_addend) => {
+                                    let duty_phase;
+                                    let duty_phase_inc;
+                                    let multiplier;
+                                    if channel.phase < channel_addend.duty_cycle {
+                                        duty_phase = channel.phase / channel_addend.duty_cycle;
+                                        duty_phase_inc = phase_inc / channel_addend.duty_cycle;
+                                        multiplier = volume;
+                                    } else {
+                                        duty_phase = (channel.phase - channel_addend.duty_cycle)
+                                            / (1.0f32 - channel_addend.duty_cycle);
+                                        duty_phase_inc =
+                                            phase_inc / (1.0f32 - channel_addend.duty_cycle);
+                                        multiplier = -(volume as i32) as i16;
+                                    }
+                                    sample = (multiplier as f32
+                                        * polyblep(duty_phase, duty_phase_inc))
+                                        as i16;
+                                }
+                                ChannelAddendMut::Triangle => {
+                                    sample = (volume as f32
+                                        * (2. * (2. * channel.phase - 1.).abs() - 1.))
+                                        as i16;
+                                }
+                                ChannelAddendMut::Noise(_) => unreachable!(),
+                            }
                         }
                     }
                     if channel.pan as i32 != 1_i32 {
@@ -270,7 +292,7 @@ impl Apu {
     }
 }
 
-impl Channel {
+impl GeneralChannel {
     fn get_current_frequency(&self, time: u64) -> f32 {
         if self.freq2 > 0. {
             rampf(
