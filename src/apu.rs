@@ -1,5 +1,57 @@
 use std::{cmp::min, iter};
 
+pub const PAN_LEFT_FLAG: u32 = 16;
+pub const PAN_RIGHT_FLAG: u32 = 32;
+
+#[derive(Clone, Copy)]
+pub struct Durations {
+    attack_to: u32,
+    decay_to: u32,
+    sustain_to: u32,
+    release_to: u32,
+}
+
+impl Durations {
+    #[must_use]
+    pub fn crop(self, frames: u32) -> Durations {
+        Durations {
+            attack_to: self.attack_to.min(frames),
+            decay_to: self.decay_to.min(frames),
+            sustain_to: self.sustain_to.min(frames),
+            release_to: self.release_to.min(frames),
+        }
+    }
+}
+
+impl From<u32> for Durations {
+    fn from(duration: u32) -> Durations {
+        let attack_to = duration >> 24 & 0xFF;
+        let decay_to = attack_to + (duration >> 16 & 0xFF);
+        let sustain_to = decay_to + (duration & 0xFF);
+        let release_to = sustain_to + (duration >> 8 & 0xFF);
+        Durations {
+            attack_to,
+            decay_to,
+            sustain_to,
+            release_to,
+        }
+    }
+}
+
+impl From<Durations> for u32 {
+    fn from(durations: Durations) -> u32 {
+        let attack = durations.attack_to;
+        assert_eq!(attack & !0xFF, 0);
+        let decay = durations.decay_to - durations.attack_to;
+        assert_eq!(decay & !0xFF, 0);
+        let sustain = durations.sustain_to - durations.decay_to;
+        assert_eq!(sustain & !0xFF, 0);
+        let release = durations.release_to - durations.sustain_to;
+        assert_eq!(release & !0xFF, 0);
+        attack << 24 | decay << 16 | sustain | release << 8
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NoiseAddend {
     seed: u16,
@@ -86,11 +138,11 @@ impl Channels {
     }
 }
 
-#[derive(Default)]
 pub struct Apu {
     channels: Channels,
     time: u64,
     ticks: u64,
+    sample_rate: u32,
 }
 
 fn lerp(value1: i32, value2: i32, t: f32) -> i32 {
@@ -134,23 +186,28 @@ fn midi_freq(note: u8, bend: u8) -> f32 {
 }
 
 impl Apu {
-    pub fn new() -> Apu {
-        Apu::default()
+    pub fn new(sample_rate: u32) -> Self {
+        Apu {
+            channels: Channels::default(),
+            time: 0,
+            ticks: 0,
+            sample_rate,
+        }
     }
 
     pub fn tick(&mut self) {
         self.ticks = self.ticks.checked_add(1).expect("APU tick overflow");
     }
 
-    pub fn tone(&mut self, frequency: i32, duration: i32, volume: i32, flags: i32) {
+    pub fn tone(&mut self, frequency: u32, duration: u32, volume: u32, flags: u32) {
         let freq1 = frequency & 0xffff;
         let freq2 = frequency >> 16 & 0xffff;
         let sustain = duration & 0xff;
         let release = duration >> 8 & 0xff;
         let decay = duration >> 16 & 0xff;
         let attack = duration >> 24 & 0xff;
-        let sustain_volume = min(volume & 0xff, 100);
-        let peak_volume = min(volume >> 8 & 0xff, 100);
+        let sustain_volume = min(volume & 0xff, 100) as i32;
+        let peak_volume = min(volume >> 8 & 0xff, 100) as i32;
         let channel_idx = (flags & 0x3) as usize;
         let mode = flags >> 2 & 0x3;
         let pan = flags >> 4 & 0x3;
@@ -161,10 +218,10 @@ impl Apu {
         }
         if note_mode != 0 {
             channel.freq1 = midi_freq(freq1 as u8, (freq1 >> 8) as u8);
-            channel.freq2 = if freq2 == 0_i32 {
+            channel.freq2 = if freq2 == 0 {
                 0.
             } else {
-                midi_freq((freq2 & 0xff_i32) as u8, (freq2 >> 8_i32) as u8)
+                midi_freq((freq2 & 0xff) as u8, (freq2 >> 8) as u8)
             };
         } else {
             channel.freq1 = freq1 as f32;
@@ -172,23 +229,27 @@ impl Apu {
         }
         channel.start_time = self.time;
         channel.attack_time =
-            (channel.start_time).wrapping_add((44100_i32 * attack / 60_i32) as u64);
+            (channel.start_time).wrapping_add((self.sample_rate * attack / 60) as u64);
         channel.decay_time =
-            (channel.attack_time).wrapping_add((44100_i32 * decay / 60_i32) as u64);
+            (channel.attack_time).wrapping_add((self.sample_rate * decay / 60) as u64);
         channel.sustain_time =
-            (channel.decay_time).wrapping_add((44100_i32 * sustain / 60_i32) as u64);
+            (channel.decay_time).wrapping_add((self.sample_rate * sustain / 60) as u64);
         channel.release_time =
-            (channel.sustain_time).wrapping_add((44100_i32 * release / 60_i32) as u64);
+            (channel.sustain_time).wrapping_add((self.sample_rate * release / 60) as u64);
         channel.end_tick = self
             .ticks
             .wrapping_add(attack as u64)
             .wrapping_add(decay as u64)
             .wrapping_add(sustain as u64)
             .wrapping_add(release as u64);
-        let max_volume = if channel_idx == 2 { 0x2000_i16 } else { 0x1333 };
+        let max_volume = if let ChannelAddendMut::Triangle = channel_addend {
+            0x2000_i16
+        } else {
+            0x1333
+        };
         channel.sustain_volume = (max_volume as i32 * sustain_volume / 100_i32) as i16;
         channel.peak_volume = if peak_volume != 0 {
-            (max_volume as i32 * peak_volume / 100_i32) as i16
+            (max_volume as i32 * peak_volume / 100) as i16
         } else {
             max_volume
         };
@@ -206,12 +267,24 @@ impl Apu {
                 }
                 _ => unreachable!(),
             },
-            ChannelAddendMut::Triangle if release == 0_i32 => {
-                channel.release_time =
-                    (channel.release_time).wrapping_add((44100_i32 / 1000_i32) as u64);
+            ChannelAddendMut::Triangle if release == 0 => {
+                channel.release_time += (self.sample_rate / 1000) as u64;
             }
             _ => (),
         }
+    }
+
+    pub fn is_silent(&self) -> bool {
+        let c = &self.channels;
+        [
+            c.pulse[0].general.end_tick,
+            c.pulse[1].general.end_tick,
+            c.triangle.general.end_tick,
+            c.noise.general.end_tick,
+        ]
+        .into_iter()
+        .max()
+        .is_some_and(|end_tick| end_tick < self.ticks)
     }
 }
 
@@ -225,11 +298,12 @@ impl Iterator for Apu {
         for (channel, channel_addend) in self.channels.iter_mut() {
             if self.time < channel.release_time || self.ticks == channel.end_tick {
                 let freq = channel.get_current_frequency(self.time);
-                let volume = channel.get_current_volume(self.time);
+                let volume = channel.get_current_volume(self.time, self.sample_rate);
                 let sample;
                 match channel_addend {
                     ChannelAddendMut::Noise(channel_addend) => {
-                        channel.phase += freq * freq / (1000000.0f32 / 44100. * 44100.);
+                        let sample_rate = self.sample_rate as f32;
+                        channel.phase += freq * freq / (1000000.0 / sample_rate * sample_rate);
                         while channel.phase > 0. {
                             channel.phase -= 1.;
                             channel_addend.seed = (channel_addend.seed as i32
@@ -247,7 +321,7 @@ impl Iterator for Apu {
                         sample = (volume as i32 * channel_addend.last_random as i32) as i16;
                     }
                     _ => {
-                        let phase_inc = freq / 44100.;
+                        let phase_inc = freq / self.sample_rate as f32;
                         channel.phase += phase_inc;
                         if channel.phase >= 1. {
                             channel.phase -= 1.;
@@ -308,9 +382,9 @@ impl GeneralChannel {
         }
     }
 
-    fn get_current_volume(&self, time: u64) -> i16 {
+    fn get_current_volume(&self, time: u64, sample_rate: u32) -> i16 {
         if time >= self.sustain_time
-            && (self.release_time).wrapping_sub(self.sustain_time) > (44100_i32 / 1000_i32) as u64
+            && (self.release_time).wrapping_sub(self.sustain_time) > (sample_rate / 1000) as u64
         {
             ramp(
                 time,

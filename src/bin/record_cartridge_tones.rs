@@ -1,6 +1,6 @@
 use std::{io::Read, path::PathBuf};
 
-use sound_mimic::{audio, cartridge, tone_stream, Cartridge};
+use sound_mimic::{apu, cartridge, tone_stream, Cartridge};
 
 #[derive(argh::FromArgs)]
 /// Record tones played on a cartridge. Outputs CSV table with recorded tones
@@ -64,7 +64,7 @@ impl<W: std::io::Write> cartridge::Engine for ToneRecorder<W> {
             .ok()
             .filter(|_| self.duration_crop)
         {
-            duration = audio::Durations::from(duration).crop(ends_within).into();
+            duration = apu::Durations::from(duration).crop(ends_within).into();
         }
 
         self.writer.write_tone(frequency, duration, volume, flags)?;
