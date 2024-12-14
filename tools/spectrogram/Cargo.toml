@@ -1,0 +1,12 @@
+[package]
+name = "spectrogram"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argh = { workspace = true }
+hound = { workspace = true }
+sound-mimic = { workspace = true }
+fft = { workspace = true }
+nalgebra = { workspace = true }
+image = "0.25.5"

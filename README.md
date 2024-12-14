@@ -21,14 +21,14 @@ While tone CSV tables are most straight forward, to interact with output media y
 
 ```bash
 # look at cartridge.wasm tones for 1 second (60 frames) of execution
-cargo run --bin record_cartridge_tones -- assets/cartridge.wasm 60
+cargo run -p record_cartridge_tones -- assets/cartridge.wasm 60
 
 # save cartridge.wasm tones for 10 seconds (600 frames) of execution
-cargo run --bin record_cartridge_tones -- assets/cartridge.wasm 600 | cargo run --bin tone_playback > assets/cartridge_recording.wav
+cargo run -p record_cartridge_tones -- assets/cartridge.wasm 600 | cargo run -p tone_playback > assets/cartridge_recording.wav
 
 # save spectrogram of a sound.wav into sound_spectrogram.png
-cat assets/sound.wav | cargo run --bin spectrogram -r -- png -w 800 -h 800 > assets/sound_spectrogram.png
+cat assets/sound.wav | cargo run -p spectrogram -r -- png -w 800 -h 800 > assets/sound_spectrogram.png
 
 # generate and playback mimic tones of a sound.wav (use `-r` flag to run in release mode)
-cargo run --bin mimic -r -- assets/sound.wav | cargo run --bin tone_playback | vlc --play-and-exit --intf dummy -
+cargo run -p mimic -r -- assets/sound.wav | cargo run -p tone_playback | vlc --play-and-exit --intf dummy -
 ```

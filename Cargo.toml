@@ -1,27 +1,24 @@
+[workspace]
+members = [".", "crates/*", "tools/*"]
+
+[workspace.dependencies]
+anyhow = "1.0.79"
+argh = "0.1.12"
+cartridge = { path = "crates/cartridge" }
+sound-mimic = { path = "." }
+hound = "3.5.1"
+nalgebra = { version = "0.33.2", features = ["rayon"] }
+fft = { package = "rustfft", version = "6.1.0" }
+
 [package]
 name = "sound-mimic"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-profile = []
-apple-accelerate = ["dep:apple-accelerate"]
-
 [dependencies]
-anyhow = "1.0.79"
-argh = "0.1.12"
-hound = "3.5.1"
-image = "0.25.5"
-nalgebra = { version = "0.33.2", features = ["rayon"] }
-ordered-float = "4.2.0"
-rayon = "1.8.0"
-fft = { package = "rustfft", version = "6.1.0" }
+anyhow = { workspace = true }
 tracing = "0.1.40"
 tracing-timing = "0.6.0"
-wt = { package = "wasmtime", version = "27.0.0" }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-accelerate = { optional = true, git = "https://github.com/zetanumbers/apple-accelerate.git" }
 
 [profile.release]
 # lto = true

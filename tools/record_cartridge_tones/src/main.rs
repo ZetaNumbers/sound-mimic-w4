@@ -1,6 +1,7 @@
 use std::{io::Read, path::PathBuf};
 
-use sound_mimic::{apu, cartridge, tone_stream, Cartridge};
+use cartridge::Cartridge;
+use sound_mimic::{apu, tone_stream};
 
 #[derive(argh::FromArgs)]
 /// Record tones played on a cartridge. Outputs CSV table with recorded tones

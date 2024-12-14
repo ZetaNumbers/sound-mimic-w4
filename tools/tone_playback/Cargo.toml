@@ -1,0 +1,9 @@
+[package]
+name = "tone_playback"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sound-mimic = { workspace = true }
+argh = { workspace = true }
+hound = { workspace = true }

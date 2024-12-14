@@ -1,0 +1,8 @@
+[package]
+name = "cartridge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+wt = { package = "wasmtime", version = "27.0.0" }
