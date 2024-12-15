@@ -6,14 +6,14 @@ use std::{
 };
 
 use fft::{
+    Fft, FftPlanner,
     num_complex::{Complex, Complex32},
     num_traits::Zero,
-    Fft, FftPlanner,
 };
 use nalgebra as na;
 use ordered_float::NotNan;
 use rayon::prelude::*;
-use sound_mimic::{apu, tone_stream, Apu, FRAMERATE};
+use sound_mimic::{Apu, FRAMERATE, apu, tone_stream};
 
 const MIN_FREQUENCY: u32 = 20;
 const MAX_FREQUENCY: u32 = 20000;
@@ -360,7 +360,7 @@ impl Iterator for ComplexSamplesInSlidingFrames {
     type Item = na::DMatrix<Complex32>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= FRAMERATE as usize {
+        if self.offset >= self.samples_per_frame {
             return None;
         }
         let samples = &self.samples[self.offset..];
@@ -391,7 +391,7 @@ fn fourier_scale_factor(len: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{fourier_scale_factor, na};
-    use fft::{num_complex::Complex32, FftPlanner};
+    use fft::{FftPlanner, num_complex::Complex32};
 
     #[test]
     fn spectral_density_scale_factor() {
