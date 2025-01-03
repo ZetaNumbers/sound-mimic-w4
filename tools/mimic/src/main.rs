@@ -1,18 +1,14 @@
 use std::{f32::consts::TAU, fs::File, io::BufReader};
 
 use burn::{prelude::*, tensor};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use sound_mimic::{Apu, FRAMERATE, apu, tone_stream};
 
-type Backend = burn::backend::LibTorch;
+type Backend = burn::backend::NdArray;
 
 #[allow(unreachable_code)]
 fn device() -> Device<Backend> {
-    #[cfg(target_os = "macos")]
-    return burn::backend::libtorch::LibTorchDevice::Mps;
-    // TODO: Add CUDA
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    return burn::backend::libtorch::LibTorchDevice::Vulkan;
-    burn::backend::libtorch::LibTorchDevice::Cpu
+    <_>::default()
 }
 
 const MIN_FREQUENCY: u32 = 20;
@@ -312,6 +308,7 @@ impl Tones {
             .and_then(|s| s.checked_mul(ntone_freq))
             .and_then(|s| s.checked_mul(nfreq))
             .and_then(|s| s.checked_mul(4)) // 4 bytes of f32
+            .and_then(|s| s.checked_mul(rayon::current_num_threads()))
             .unwrap();
         let splits = mem_estimate.div_ceil(bound_mem);
 
@@ -324,67 +321,68 @@ impl Tones {
 
         let offset_frame_chunks = offset_frames.chunk(offset_chunks, 0);
 
-        let mut optimal_tone_idx_by_offset_chunk = Vec::with_capacity(offset_frame_chunks.len());
-        let mut error_by_offset_chunk = Vec::with_capacity(offset_frame_chunks.len());
-        let mut scales_by_offset_chunk = Vec::with_capacity(offset_frame_chunks.len());
-
         let progress = indicatif::ProgressBar::new(offset_frame_chunks.len().try_into().unwrap());
 
-        for offset_frames in offset_frame_chunks {
-            let offset_frame_chunks = offset_frames.chunk(frame_chunks, 1);
+        let (scales_by_offset_chunk, (error_by_offset_chunk, optimal_tone_idx_by_offset_chunk)) =
+            offset_frame_chunks
+                .into_par_iter()
+                .map(|offset_frames| {
+                    let offset_frame_chunks = offset_frames.chunk(frame_chunks, 1);
 
-            let mut optimal_tone_idx_by_frame_chunk = Vec::with_capacity(offset_frame_chunks.len());
-            let mut error_by_frame_chunk = Vec::with_capacity(offset_frame_chunks.len());
-            let mut scales_by_frame_chunk = Vec::with_capacity(offset_frame_chunks.len());
+                    let (
+                        scales_by_frame_chunk,
+                        (error_by_frame_chunk, optimal_tone_idx_by_frame_chunk),
+                    ) = offset_frame_chunks
+                        .into_par_iter()
+                        .map(|offset_frames| {
+                            let [noffsets, nframes, _] = offset_frames.dims();
 
-            for offset_frames in offset_frame_chunks {
-                let [noffsets, nframes, _] = offset_frames.dims();
+                            // scales: chunk_offset * chunk_frame * tone_freq
+                            let scales = offset_frames.clone().matmul(
+                                trans_norm_spectrums
+                                    .clone()
+                                    .unsqueeze_dim(0)
+                                    .repeat_dim(0, noffsets),
+                            );
+                            // tone_spectrums_scaled: chunk_offset * chunk_frame * tone_freq * freq
+                            let tone_spectrums_scaled = self
+                                .norm_spectrums
+                                .clone()
+                                .unsqueeze_dims::<4>(&[0, 1])
+                                .repeat(&[noffsets, nframes, 1, 1])
+                                .mul(scales.clone().unsqueeze_dim::<4>(3).repeat_dim(3, nfreq));
+                            // TODO: try a-weighted error
+                            // error: chunk_offset * chunk_frame * tone_freq
+                            let error = offset_frames
+                                .unsqueeze_dim::<4>(2)
+                                .repeat_dim(2, ntone_freq)
+                                .sub(tone_spectrums_scaled)
+                                .powi_scalar(2)
+                                .sum_dim(3)
+                                .squeeze::<3>(3);
 
-                // scales: chunk_offset * chunk_frame * tone_freq
-                let scales = offset_frames.clone().matmul(
-                    trans_norm_spectrums
-                        .clone()
-                        .unsqueeze_dim(0)
-                        .repeat_dim(0, noffsets),
-                );
-                // tone_spectrums_scaled: chunk_offset * chunk_frame * tone_freq * freq
-                let tone_spectrums_scaled = self
-                    .norm_spectrums
-                    .clone()
-                    .unsqueeze_dims::<4>(&[0, 1])
-                    .repeat(&[noffsets, nframes, 1, 1])
-                    .mul(scales.clone().unsqueeze_dim::<4>(3).repeat_dim(3, nfreq));
-                // TODO: try a-weighted error
-                // error: chunk_offset * chunk_frame * tone_freq
-                let error = offset_frames
-                    .unsqueeze_dim::<4>(2)
-                    .repeat_dim(2, ntone_freq)
-                    .sub(tone_spectrums_scaled)
-                    .powi_scalar(2)
-                    .sum_dim(3)
-                    .squeeze::<3>(3);
+                            // error: chunk_offset * chunk_frame * 1
+                            // optimal_tone_idx: chunk_offset * chunk_frame * 1
+                            let (error, optimal_tone_idx) = error.min_dim_with_indices(2);
 
-                // error: chunk_offset * chunk_frame * 1
-                // optimal_tone_idx: chunk_offset * chunk_frame * 1
-                let (error, optimal_tone_idx) = error.min_dim_with_indices(2);
+                            // scales: chunk_offset * chunk_frame * 1
+                            let scales = scales.gather(2, optimal_tone_idx.clone());
 
-                // scales: chunk_offset * chunk_frame * 1
-                let scales = scales.gather(2, optimal_tone_idx.clone());
+                            assert!(!scales.contains_nan().into_scalar());
 
-                scales_by_frame_chunk.push(scales);
-                error_by_frame_chunk.push(error);
-                optimal_tone_idx_by_frame_chunk.push(optimal_tone_idx);
-            }
+                            (scales, (error, optimal_tone_idx))
+                        })
+                        .collect();
 
-            let error = Tensor::cat(error_by_frame_chunk, 1);
-            let optimal_tone_idx = Tensor::cat(optimal_tone_idx_by_frame_chunk, 1);
-            let scales = Tensor::cat(scales_by_frame_chunk, 1);
+                    let scales = Tensor::cat(scales_by_frame_chunk, 1);
+                    let error = Tensor::cat(error_by_frame_chunk, 1);
+                    let optimal_tone_idx = Tensor::cat(optimal_tone_idx_by_frame_chunk, 1);
 
-            scales_by_offset_chunk.push(scales);
-            error_by_offset_chunk.push(error);
-            optimal_tone_idx_by_offset_chunk.push(optimal_tone_idx);
-            progress.inc(1);
-        }
+                    progress.inc(1);
+
+                    (scales, (error, optimal_tone_idx))
+                })
+                .collect();
         progress.finish_with_message("Traversed all tones");
 
         let error = Tensor::cat(error_by_offset_chunk, 0);
@@ -399,6 +397,7 @@ impl Tones {
         let optimal_tone_idx = optimal_tone_idx
             .narrow(0, offset.try_into().unwrap(), 1)
             .squeeze::<2>(0);
+        let offset = offset.into();
         // scales: frame
         let scales = scales
             .slice([Some((offset, offset + 1)), None, None])
