@@ -1,19 +1,19 @@
-use std::{
-    fs::File,
-    io::BufReader,
-    ops::{MulAssign, Range},
-    sync::Arc,
-};
+use std::{f32::consts::TAU, fs::File, io::BufReader};
 
-use fft::{
-    Fft, FftPlanner,
-    num_complex::{Complex, Complex32},
-    num_traits::Zero,
-};
-use nalgebra as na;
-use ordered_float::NotNan;
-use rayon::prelude::*;
+use burn::{prelude::*, tensor};
 use sound_mimic::{Apu, FRAMERATE, apu, tone_stream};
+
+type Backend = burn::backend::LibTorch;
+
+#[allow(unreachable_code)]
+fn device() -> Device<Backend> {
+    #[cfg(target_os = "macos")]
+    return burn::backend::libtorch::LibTorchDevice::Mps;
+    // TODO: Add CUDA
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    return burn::backend::libtorch::LibTorchDevice::Vulkan;
+    burn::backend::libtorch::LibTorchDevice::Cpu
+}
 
 const MIN_FREQUENCY: u32 = 20;
 const MAX_FREQUENCY: u32 = 20000;
@@ -27,97 +27,100 @@ struct Mimic {
     /// input wav file path or `-` to read from stdin
     #[argh(positional)]
     wav_file: String,
+
+    /// bound tensor memory size (MiB), assuming tensor elements are in `f32`
+    #[argh(option, default = "usize::MAX")]
+    bound_mem: usize,
 }
 
 fn main() {
     let args: Mimic = argh::from_env();
 
-    let sliding_frames = if args.wav_file == "-" {
-        ComplexSamplesInSlidingFrames::load_from_wav_reader(std::io::stdin().lock())
+    let Samples {
+        samples,
+        samples_per_frame,
+    } = if args.wav_file == "-" {
+        Samples::load_from_wav_reader(std::io::stdin().lock())
     } else {
-        ComplexSamplesInSlidingFrames::load_from_wav_reader(BufReader::new(
+        Samples::load_from_wav_reader(BufReader::new(
             File::open(args.wav_file).expect("opening wav file"),
         ))
     };
+    let device = device();
+    let samples = Tensor::from_data(samples, &device);
+    let sliding_frames = sliding_frames(samples_per_frame, samples.clone());
 
-    let best_mimic_tones = sliding_frames.pick_best_mimic_tones();
+    // Crop out frames at the end to rightly compare different sample shifts
+    let nframes = sliding_frames.dims()[0] / samples_per_frame;
+    let nshifts = nframes * samples_per_frame;
+
+    let sliding_frames = sliding_frames
+        .narrow(0, 0, nshifts)
+        .reshape([nframes, samples_per_frame, samples_per_frame])
+        .swap_dims(0, 1);
+
+    let dft = Dft::new_like(&sliding_frames);
+    let offset_frames = dft.clone().apply_sqr(sliding_frames).sqrt();
+
+    let tones = Tones::new(dft);
+    let mut best_tones = tones.pick_best_for(offset_frames, args.bound_mem * 1024 * 1024);
+    best_tones.scale_to_fit();
+    let BestTones {
+        scales,
+        tone_freq,
+        offset,
+        error,
+    } = best_tones;
+
+    let scales = scales.into_data();
+    let scales = scales.iter::<f32>();
+    let tone_freq = tone_freq.into_data();
+    let tone_freq = tone_freq.iter::<u32>();
+
+    // TODO: log
+    eprintln!("Found best tones with error {error:?} at sample offset {offset:?}");
 
     let mut writer = tone_stream::Writer::new(std::io::stdout().lock()).unwrap();
-    for tone in &best_mimic_tones.frames {
-        let volume = (100.0 * tone.scale.into_inner()).clamp(0.0, 100.0).trunc() as u32;
+    for (scale, frequency) in scales.zip(tone_freq) {
+        assert!(!scale.is_nan());
+        let volume = (100.0 * scale).clamp(0.0, 100.0).trunc() as u32;
         writer
-            .write_tone(tone.frequency, 1, volume, apu::TRIANGLE_CHANNEL_FLAG)
+            .write_tone(frequency, 1, volume, apu::TRIANGLE_CHANNEL_FLAG)
             .unwrap();
         writer.step_frame().unwrap();
     }
 }
 
-#[derive(Clone, Copy)]
-struct BestTone {
-    frequency: u32,
-    scale: NotNan<f32>,
-    error: NotNan<f32>,
-}
-
 struct BestTones {
-    frames: Vec<BestTone>,
-    total_error: NotNan<f32>,
+    scales: Tensor<Backend, 1>,
+    tone_freq: Tensor<Backend, 1, tensor::Int>,
+    offset: i64,
+    error: f32,
 }
 
 impl BestTones {
-    fn new(frames: usize) -> Self {
-        BestTones {
-            frames: vec![
-                BestTone {
-                    frequency: 0,
-                    scale: NotNan::new(0.0).unwrap(),
-                    error: NotNan::new(f32::INFINITY).unwrap(),
-                };
-                frames
-            ],
-            total_error: NotNan::new(f32::INFINITY).unwrap(),
-        }
-    }
-
-    fn eval_total_error(&mut self) {
-        self.total_error = self.frames.iter().map(|t| t.error).sum();
-    }
-
-    fn max_scale(&self) -> Option<f32> {
-        self.frames
-            .iter()
-            .map(|t| t.scale)
-            .max()
-            .map(|f| f.into_inner())
-    }
-
     fn scale_to_fit(&mut self) {
-        let Some(max_scale) = self.max_scale().filter(|s| *s > 1.0) else {
+        let max_scale = self.scales.clone().max().into_scalar();
+        assert!(max_scale > 0.0);
+        if max_scale > 1.0 {
             return;
-        };
+        }
         let scale = max_scale.recip();
-        self.frames.iter_mut().for_each(|t| t.scale *= scale);
+        self.scales.inplace(|scales| scales.mul_scalar(scale));
     }
-}
-
-fn tone(apu: &mut Apu, frequency: u32, dest: &mut [Complex32]) {
-    debug_assert_eq!(dest.len() * 60, usize::try_from(apu.sample_rate()).unwrap());
-    apu.tone(frequency, 1, 100, apu::TRIANGLE_CHANNEL_FLAG);
-    dest.fill_with(|| (apu.next().unwrap()[0] as f32 / u16::MAX as f32).into());
-    apu.tick();
 }
 
 /// Gets every possible frame offset to pick the best candidate.
 ///
 /// Output of this iterator represents a matrix with samples converted into
 /// complex values, while each column represents a samples within one frame.
-struct ComplexSamplesInSlidingFrames {
-    offset: usize,
+#[derive(Clone)]
+struct Samples {
     samples_per_frame: usize,
-    samples: Vec<Complex32>,
+    samples: TensorData,
 }
 
-impl ComplexSamplesInSlidingFrames {
+impl Samples {
     fn load_from_wav_reader<R>(reader: R) -> Self
     where
         R: std::io::Read,
@@ -136,286 +139,285 @@ impl ComplexSamplesInSlidingFrames {
             (hound::SampleFormat::Int, 16),
             "input sound has to have samples of type i16"
         );
-        ComplexSamplesInSlidingFrames {
-            offset: 0,
+        let wav_len = wav.len().try_into().unwrap();
+        Samples {
             samples_per_frame: (wav_spec.sample_rate / FRAMERATE).try_into().unwrap(),
-            samples: wav
-                .into_samples::<i16>()
-                .map(|s| {
-                    (s.expect("error while reading wav file") as f32 / -(i16::MIN as f32)).into()
-                })
-                .collect(),
+            samples: TensorData::new::<f32, _>(
+                wav.into_samples::<i16>()
+                    .map(|s| {
+                        (s.expect("error while reading wav file") as f32 / -(i16::MIN as f32))
+                            .into()
+                    })
+                    .collect(),
+                [wav_len],
+            ),
         }
-    }
-
-    fn pick_best_mimic_tones(self) -> BestTones {
-        struct Context {
-            samples_per_frame: usize,
-            lower_nonconjugate_nrows: usize,
-            conjugate_rows: Range<usize>,
-            forward_fft: Arc<dyn Fft<f32>>,
-            fft_descale: f32,
-            tone_spectrums: na::DMatrix<f32>,
-            original_descale: Vec<NotNan<f32>>,
-        }
-
-        impl Context {
-            fn new(samples_per_frame: usize) -> Self {
-                let mut fft_planner = FftPlanner::<f32>::new();
-                let lower_nonconjugate_nrows = samples_per_frame / 2 + 1;
-                let mut out = Context {
-                    conjugate_rows: 1..(samples_per_frame + 1) / 2,
-                    forward_fft: fft_planner.plan_fft_forward(samples_per_frame),
-                    fft_descale: fourier_scale_factor(samples_per_frame),
-                    tone_spectrums: na::DMatrix::zeros(
-                        lower_nonconjugate_nrows,
-                        (MAX_FREQUENCY - MIN_FREQUENCY).try_into().unwrap(),
-                    ),
-                    original_descale: Vec::new(),
-                    lower_nonconjugate_nrows,
-                    samples_per_frame,
-                };
-                out.tone_bases_init();
-                out
-            }
-
-            fn local_context(&self) -> LocalContext<'_> {
-                LocalContext {
-                    cx: self,
-                    fft_scratch: vec![
-                        Complex32::zero();
-                        self.forward_fft.get_inplace_scratch_len()
-                    ],
-                    tone_spectrum_scaled: na::DVector::zeros(self.lower_nonconjugate_nrows),
-                }
-            }
-
-            #[cfg_attr(feature = "profile", inline(never))]
-            fn tone_bases_init(&mut self) {
-                self.original_descale = self
-                    .tone_spectrums
-                    .par_column_iter_mut()
-                    .enumerate()
-                    .map_init(
-                        || {
-                            (
-                                vec![Complex32::zero(); self.forward_fft.get_inplace_scratch_len()],
-                                na::DVector::zeros(self.samples_per_frame),
-                                Apu::new(self.samples_per_frame as u32 * FRAMERATE),
-                            )
-                        },
-                        |(fft_scratch, tone_samples, apu), (column_idx, mut tone_spectrum)| {
-                            let frequency = MIN_FREQUENCY + u32::try_from(column_idx).unwrap();
-                            tone(apu, frequency, tone_samples.as_mut_slice());
-                            self.forward_fft
-                                .process_with_scratch(tone_samples.as_mut_slice(), fft_scratch);
-                            let tone_spectrum_view =
-                                tone_samples.rows(0, self.lower_nonconjugate_nrows);
-                            assert_eq!(tone_spectrum.shape(), tone_spectrum_view.shape());
-                            tone_spectrum
-                                .zip_apply(&tone_spectrum_view, |dest, src| *dest = src.norm());
-                            {
-                                tone_spectrum[0] *= self.fft_descale;
-                                tone_spectrum
-                                    .rows_range_mut(self.conjugate_rows.clone())
-                                    .mul_assign(2.0 * self.fft_descale);
-                                if self.samples_per_frame % 2 == 0 {
-                                    tone_spectrum[self.lower_nonconjugate_nrows - 1] *=
-                                        self.fft_descale;
-                                }
-                            }
-                            let original_descale =
-                                NotNan::new(tone_spectrum.norm().recip()).unwrap();
-                            tone_spectrum *= original_descale.into_inner();
-                            // ^ we pick the best orthonormal basis of one vector
-                            original_descale
-                        },
-                    )
-                    .collect();
-            }
-        }
-
-        struct LocalContext<'a> {
-            cx: &'a Context,
-            fft_scratch: Vec<Complex32>,
-            tone_spectrum_scaled: na::DVector<f32>,
-        }
-
-        impl LocalContext<'_> {
-            fn pick_best_mimic_tones(&mut self, mut frames: na::DMatrix<Complex32>) -> BestTones {
-                self.cx
-                    .forward_fft
-                    .process_with_scratch(frames.as_mut_slice(), &mut self.fft_scratch);
-
-                let frames = {
-                    let fft_descale = fourier_scale_factor(self.cx.samples_per_frame);
-                    let mut frames = frames
-                        .rows(0, self.cx.lower_nonconjugate_nrows)
-                        .map(Complex::norm);
-                    frames.row_mut(0).mul_assign(fft_descale);
-                    frames
-                        .rows_range_mut(self.cx.conjugate_rows.clone())
-                        .mul_assign(2.0 * self.cx.fft_descale);
-                    if self.cx.samples_per_frame % 2 == 0 {
-                        frames
-                            .row_mut(self.cx.lower_nonconjugate_nrows - 1)
-                            .mul_assign(fft_descale);
-                    }
-                    frames
-                };
-
-                let mut best_tones = BestTones::new(frames.ncols());
-
-                self.pick_best_mimic_tones_impl(frames, &mut best_tones);
-                best_tones.eval_total_error();
-                best_tones
-            }
-
-            #[cfg_attr(feature = "profile", inline(never))]
-            fn pick_best_mimic_tones_impl(
-                &mut self,
-                frames: na::Matrix<f32, na::Dyn, na::Dyn, na::VecStorage<f32, na::Dyn, na::Dyn>>,
-                best_tones: &mut BestTones,
-            ) {
-                self.cx
-                    .tone_spectrums
-                    .column_iter()
-                    .zip(&self.cx.original_descale)
-                    .enumerate()
-                    .for_each(
-                        |(tone_spectrum_column_idx, (tone_spectrum, original_descale))| {
-                            let frequency =
-                                MIN_FREQUENCY + u32::try_from(tone_spectrum_column_idx).unwrap();
-                            frames.column_iter().zip(&mut best_tones.frames).for_each(
-                                |(frame, best_tone)| {
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
-                                    let scale = frame.dot(&tone_spectrum);
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    let scale = apple_accelerate::dot_product(
-                                        frame.as_slice(),
-                                        tone_spectrum.as_slice(),
-                                    );
-                                    let scale = NotNan::new(scale).unwrap();
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    apple_accelerate::scale(
-                                        tone_spectrum.as_slice(),
-                                        scale.into_inner(),
-                                        self.tone_spectrum_scaled.as_mut_slice(),
-                                    );
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
-                                    {
-                                        self.tone_spectrum_scaled.copy_from(&tone_spectrum);
-                                        self.tone_spectrum_scaled.scale_mut(scale.into_inner());
-                                    }
-
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
-                                    let error = self.tone_spectrum_scaled.metric_distance(&frame);
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    let error = apple_accelerate::distance_squared(
-                                        self.tone_spectrum_scaled.as_slice(),
-                                        frame.as_slice(),
-                                    )
-                                    .sqrt();
-                                    let error = NotNan::new(error).unwrap();
-
-                                    if best_tone.error > error {
-                                        *best_tone = BestTone {
-                                            scale: scale * original_descale,
-                                            frequency,
-                                            error,
-                                        };
-                                    }
-                                },
-                            );
-                        },
-                    );
-            }
-        }
-
-        let cx = Context::new(self.samples_per_frame);
-
-        let mut best_mimic_tones = self
-            .par_bridge()
-            .map_init(
-                || cx.local_context(),
-                |lcx, frames| lcx.pick_best_mimic_tones(frames),
-            )
-            .min_by_key(|t| t.total_error)
-            .expect("input sound has not enough samples");
-        best_mimic_tones.scale_to_fit();
-        best_mimic_tones
     }
 }
 
-impl Iterator for ComplexSamplesInSlidingFrames {
-    type Item = na::DMatrix<Complex32>;
+// return: shift * frame_sample
+/// Rearrange samples as sliding frame samples.
+fn sliding_frames(samples_per_frame: usize, samples: Tensor<Backend, 1>) -> Tensor<Backend, 2> {
+    let [nsamples] = samples.dims();
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.samples_per_frame {
-            return None;
+    let nshifts = nsamples + 1 - samples_per_frame;
+    let device = samples.device();
+    let frame_sample_indices = Tensor::arange(0..samples_per_frame.try_into().unwrap(), &device);
+    let shift_indices = Tensor::arange(0..i64::try_from(nshifts).unwrap(), &device);
+    let indices = shift_indices
+        .unsqueeze_dim::<2>(1)
+        .repeat_dim(1, samples_per_frame)
+        .add(frame_sample_indices.unsqueeze_dim(0).repeat_dim(0, nshifts))
+        .flatten(0, 1);
+    samples
+        .gather(0, indices)
+        .reshape([nshifts, samples_per_frame])
+}
+
+/// Real valued DFT.
+#[derive(Clone)]
+struct Dft {
+    cos: Tensor<Backend, 2>,
+    sin: Tensor<Backend, 2>,
+}
+
+impl Dft {
+    fn new(samples_per_frame: usize, device: &Device<Backend>) -> Self {
+        let freq_ncols = samples_per_frame;
+        let freq_nrows = samples_per_frame / 2;
+
+        let cols =
+            Tensor::<Backend, 1, _>::arange(0..freq_ncols.try_into().unwrap(), device).float();
+        let rows = Tensor::arange(1..(freq_nrows + 1).try_into().unwrap(), device).float();
+
+        let freqs = cols.unsqueeze_dim::<2>(1).repeat_dim(1, freq_nrows).mul(
+            rows.mul_scalar(TAU / samples_per_frame as f32)
+                .unsqueeze_dim(0)
+                .repeat_dim(0, freq_ncols),
+        );
+
+        Dft {
+            cos: freqs.clone().cos(),
+            sin: freqs.sin(),
         }
-        let samples = &self.samples[self.offset..];
-        // Eliminate last frame if it's incomplete with integer division
-        let frames = samples.len() / self.samples_per_frame;
-        if frames < 1 {
-            return None;
-        }
-        let samples = &samples[..frames * self.samples_per_frame];
-        let out = na::DMatrix::from_column_slice(self.samples_per_frame, frames, samples);
-        self.offset += 1;
-        Some(out)
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(FRAMERATE as usize - self.offset - 1))
+    fn new_like<const D: usize>(sliding_frames: &Tensor<Backend, D>) -> Self {
+        Dft::new(
+            *sliding_frames.dims().last().unwrap(),
+            &sliding_frames.device(),
+        )
     }
-}
 
-fn fourier_scale_factor_sqr(len: usize) -> f32 {
-    (len as f32).recip()
-}
+    fn device(&self) -> Device<Backend> {
+        self.cos.device()
+    }
 
-fn fourier_scale_factor(len: usize) -> f32 {
-    fourier_scale_factor_sqr(len).sqrt()
-}
+    fn samples_per_frame(&self) -> usize {
+        self.cos.dims()[0]
+    }
 
-#[cfg(test)]
-mod tests {
-    use super::{fourier_scale_factor, na};
-    use fft::{FftPlanner, num_complex::Complex32};
+    // frames: ... * frame_sample
+    // return: ... * freq
+    fn apply_sqr<const D: usize>(self, frames: Tensor<Backend, D>) -> Tensor<Backend, D> {
+        assert!(D >= 2);
 
-    #[test]
-    fn spectral_density_scale_factor() {
-        const SAMPLE_COUNT: usize = 1024;
+        let mut repeat_dims = frames.dims();
+        *repeat_dims.last_chunk_mut::<2>().unwrap() = [1, 1];
 
-        let mut fft_planner = FftPlanner::new();
-        let mut v = na::DVector::from_fn(SAMPLE_COUNT, |i, _| {
-            let t = i as f32 * std::f32::consts::TAU / SAMPLE_COUNT as f32;
-            Complex32::from_polar(1.0, t)
+        let new_axes = frames.dims().map({
+            let mut i = 0;
+            move |_| {
+                let t = i;
+                i += 1;
+                t
+            }
         });
+        // Crop out two last elements
+        let new_axes = &new_axes[0..D - 2];
 
-        let prenorm = v.norm();
-        let scale_factor = fourier_scale_factor(SAMPLE_COUNT);
+        let zero_freq = frames.clone().sum_dim(D - 1).mul_scalar(0.5);
 
-        let fft = fft_planner.plan_fft_forward(SAMPLE_COUNT);
-        fft.process(v.as_mut_slice());
-        v.scale_mut(scale_factor);
-        let postnorm = v.norm();
-        assert!((prenorm - postnorm) < std::f32::EPSILON);
+        // transposed matrix multiplication to reverse order
+        let cos = frames
+            .clone()
+            .matmul(self.cos.unsqueeze_dims(new_axes).repeat(&repeat_dims));
+        let sin = frames.matmul(self.sin.unsqueeze_dims(new_axes).repeat(&repeat_dims));
 
-        let fft = fft_planner.plan_fft_inverse(SAMPLE_COUNT);
-        fft.process(v.as_mut_slice());
-        v.scale_mut(scale_factor);
-        let preprenorm = v.norm();
-        assert!((preprenorm - prenorm) < std::f32::EPSILON);
+        let const_amplitude = zero_freq.powi_scalar(2);
+        let wave_amplitude = cos.powi_scalar(2).add(sin.powi_scalar(2));
+        Tensor::cat(vec![const_amplitude, wave_amplitude], D - 1)
+    }
+}
+
+fn tone(apu: &mut Apu, frequency: u32, dest: &mut [f32]) {
+    debug_assert_eq!(dest.len() * 60, usize::try_from(apu.sample_rate()).unwrap());
+    apu.tone(frequency, 1, 100, apu::TRIANGLE_CHANNEL_FLAG);
+    dest.fill_with(|| apu.next().unwrap()[0] as f32 / u16::MAX as f32);
+    apu.tick();
+}
+
+#[derive(Clone)]
+struct Tones {
+    // norm_spectrums: tone_freq * freq
+    norm_spectrums: Tensor<Backend, 2>,
+    // original_norm: tone_freq
+    original_norm: Tensor<Backend, 1>,
+}
+
+impl Tones {
+    fn new(dft: Dft) -> Self {
+        let samples_per_frame = dft.samples_per_frame();
+        let mut apu = Apu::new(u32::try_from(samples_per_frame).unwrap() * FRAMERATE);
+        // TODO: use tensor of frequencies
+        let ntone_freq = (MAX_FREQUENCY - MIN_FREQUENCY).try_into().unwrap();
+        let mut tones_samples = vec![0.0; samples_per_frame * ntone_freq];
+        for frequency in MIN_FREQUENCY..MAX_FREQUENCY {
+            let shift = usize::try_from(frequency - MIN_FREQUENCY).unwrap();
+            tone(
+                &mut apu,
+                frequency,
+                &mut tones_samples[(shift * samples_per_frame)..((shift + 1) * samples_per_frame)],
+            );
+        }
+
+        // tone_freq * frame_sample
+        let tones_samples = Tensor::from_data(
+            TensorData::new(tones_samples, [ntone_freq, samples_per_frame]),
+            &dft.device(),
+        );
+
+        // tone_freq * freq
+        let spectrums_sqr = dft.apply_sqr(tones_samples);
+        let original_norm = spectrums_sqr.clone().sum_dim(1).sqrt();
+        let norm_spectrums = spectrums_sqr
+            .sqrt()
+            .div(original_norm.clone().repeat_dim(1, original_norm.dims()[1]));
+
+        Tones {
+            norm_spectrums,
+            original_norm: original_norm.squeeze(1),
+        }
+    }
+
+    // offset_frame_chunks: offset * chunk_frame * freq
+    /// Bound memory usage by `bound_mem` bytes
+    fn pick_best_for(self, offset_frames: Tensor<Backend, 3>, bound_mem: usize) -> BestTones {
+        let [noffsets, nframes, nfreq] = offset_frames.dims();
+        let [ntone_freq, _] = self.norm_spectrums.dims();
+        let trans_norm_spectrums = self.norm_spectrums.clone().transpose();
+
+        let mem_estimate = noffsets
+            .checked_mul(nframes)
+            .and_then(|s| s.checked_mul(ntone_freq))
+            .and_then(|s| s.checked_mul(nfreq))
+            .and_then(|s| s.checked_mul(4)) // 4 bytes of f32
+            .unwrap();
+        let splits = mem_estimate.div_ceil(bound_mem);
+
+        let (offset_chunks, frame_chunks) = if noffsets > splits {
+            assert!(noffsets * nframes >= splits, "too little memory");
+            (noffsets, splits.div_ceil(noffsets).div_ceil(nframes))
+        } else {
+            (splits.div_ceil(noffsets), 1)
+        };
+
+        let offset_frame_chunks = offset_frames.chunk(offset_chunks, 0);
+
+        let mut optimal_tone_idx_by_offset_chunk = Vec::with_capacity(offset_frame_chunks.len());
+        let mut error_by_offset_chunk = Vec::with_capacity(offset_frame_chunks.len());
+        let mut scales_by_offset_chunk = Vec::with_capacity(offset_frame_chunks.len());
+
+        let progress = indicatif::ProgressBar::new(offset_frame_chunks.len().try_into().unwrap());
+
+        for offset_frames in offset_frame_chunks {
+            let offset_frame_chunks = offset_frames.chunk(frame_chunks, 1);
+
+            let mut optimal_tone_idx_by_frame_chunk = Vec::with_capacity(offset_frame_chunks.len());
+            let mut error_by_frame_chunk = Vec::with_capacity(offset_frame_chunks.len());
+            let mut scales_by_frame_chunk = Vec::with_capacity(offset_frame_chunks.len());
+
+            for offset_frames in offset_frame_chunks {
+                let [noffsets, nframes, _] = offset_frames.dims();
+
+                // scales: chunk_offset * chunk_frame * tone_freq
+                let scales = offset_frames.clone().matmul(
+                    trans_norm_spectrums
+                        .clone()
+                        .unsqueeze_dim(0)
+                        .repeat_dim(0, noffsets),
+                );
+                // tone_spectrums_scaled: chunk_offset * chunk_frame * tone_freq * freq
+                let tone_spectrums_scaled = self
+                    .norm_spectrums
+                    .clone()
+                    .unsqueeze_dims::<4>(&[0, 1])
+                    .repeat(&[noffsets, nframes, 1, 1])
+                    .mul(scales.clone().unsqueeze_dim::<4>(3).repeat_dim(3, nfreq));
+                // TODO: try a-weighted error
+                // error: chunk_offset * chunk_frame * tone_freq
+                let error = offset_frames
+                    .unsqueeze_dim::<4>(2)
+                    .repeat_dim(2, ntone_freq)
+                    .sub(tone_spectrums_scaled)
+                    .powi_scalar(2)
+                    .sum_dim(3)
+                    .squeeze::<3>(3);
+
+                // error: chunk_offset * chunk_frame * 1
+                // optimal_tone_idx: chunk_offset * chunk_frame * 1
+                let (error, optimal_tone_idx) = error.min_dim_with_indices(2);
+
+                // scales: chunk_offset * chunk_frame * 1
+                let scales = scales.gather(2, optimal_tone_idx.clone());
+
+                // FIXME
+                // // sync up this computation to allow next chunk to be allocated
+                // assert!(!scales.contains_nan().into_scalar());
+
+                scales_by_frame_chunk.push(scales);
+                error_by_frame_chunk.push(error);
+                optimal_tone_idx_by_frame_chunk.push(optimal_tone_idx);
+            }
+
+            let error = Tensor::cat(error_by_frame_chunk, 1);
+            let optimal_tone_idx = Tensor::cat(optimal_tone_idx_by_frame_chunk, 1);
+            let scales = Tensor::cat(scales_by_frame_chunk, 1);
+
+            scales_by_offset_chunk.push(scales);
+            error_by_offset_chunk.push(error);
+            optimal_tone_idx_by_offset_chunk.push(optimal_tone_idx);
+            progress.inc(1);
+        }
+        progress.finish_with_message("Traversed all tones");
+
+        let error = Tensor::cat(error_by_offset_chunk, 0);
+        let optimal_tone_idx = Tensor::cat(optimal_tone_idx_by_offset_chunk, 0);
+        let scales = Tensor::cat(scales_by_offset_chunk, 0);
+
+        // error: 1 * 1 * 1
+        // optimal_offset: 1 * 1 * 1
+        let (error, optimal_offset) = error.sum_dim(1).min_dim_with_indices(0);
+        let offset = optimal_offset.into_scalar();
+        // optimal_tone_idx: frame * 1
+        let optimal_tone_idx = optimal_tone_idx
+            .narrow(0, offset.try_into().unwrap(), 1)
+            .squeeze::<2>(0);
+        // scales: frame
+        let scales = scales
+            .slice([Some((offset, offset + 1)), None, None])
+            .squeeze::<2>(0)
+            .div(self.original_norm.unsqueeze_dim(0).repeat_dim(0, nframes))
+            .gather(1, optimal_tone_idx.clone())
+            .squeeze::<1>(1);
+        // tone_freq: frame
+        let tone_freq = optimal_tone_idx.squeeze::<1>(1).add_scalar(MIN_FREQUENCY);
+        let error = error.into_scalar();
+        BestTones {
+            scales,
+            tone_freq,
+            offset,
+            error,
+        }
     }
 }
