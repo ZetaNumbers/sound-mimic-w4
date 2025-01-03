@@ -10,6 +10,7 @@ use fft::{
     num_complex::{Complex, Complex32},
     num_traits::Zero,
 };
+use indicatif::ProgressBar;
 use nalgebra as na;
 use ordered_float::NotNan;
 use rayon::prelude::*;
@@ -157,6 +158,7 @@ impl ComplexSamplesInSlidingFrames {
             fft_descale: f32,
             tone_spectrums: na::DMatrix<f32>,
             original_descale: Vec<NotNan<f32>>,
+            progress_bar: ProgressBar,
         }
 
         impl Context {
@@ -172,6 +174,7 @@ impl ComplexSamplesInSlidingFrames {
                         (MAX_FREQUENCY - MIN_FREQUENCY).try_into().unwrap(),
                     ),
                     original_descale: Vec::new(),
+                    progress_bar: ProgressBar::new(samples_per_frame.try_into().unwrap()),
                     lower_nonconjugate_nrows,
                     samples_per_frame,
                 };
@@ -338,6 +341,7 @@ impl ComplexSamplesInSlidingFrames {
                             );
                         },
                     );
+                self.cx.progress_bar.inc(1);
             }
         }
 
