@@ -371,10 +371,6 @@ impl Tones {
                 // scales: chunk_offset * chunk_frame * 1
                 let scales = scales.gather(2, optimal_tone_idx.clone());
 
-                // FIXME
-                // // sync up this computation to allow next chunk to be allocated
-                // assert!(!scales.contains_nan().into_scalar());
-
                 scales_by_frame_chunk.push(scales);
                 error_by_frame_chunk.push(error);
                 optimal_tone_idx_by_frame_chunk.push(optimal_tone_idx);
