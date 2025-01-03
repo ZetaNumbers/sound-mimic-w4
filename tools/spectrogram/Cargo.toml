@@ -8,5 +8,5 @@ argh = { workspace = true }
 hound = { workspace = true }
 sound-mimic = { workspace = true }
 fft = { workspace = true }
-nalgebra = { workspace = true }
+ndarray = { workspace = true }
 image = "0.25.5"

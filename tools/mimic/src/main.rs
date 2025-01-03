@@ -5,13 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use fft::{
-    Fft, FftPlanner,
-    num_complex::{Complex, Complex32},
-    num_traits::Zero,
-};
+use fft::{Fft, FftPlanner, num_complex::Complex32, num_traits::Zero};
 use indicatif::ProgressBar;
-use nalgebra as na;
+use ndarray::{Array1, Array2, Axis, azip, s};
+use ndarray_linalg::Norm;
+use ndarray_stats::DeviationExt;
 use ordered_float::NotNan;
 use rayon::prelude::*;
 use sound_mimic::{Apu, FRAMERATE, apu, tone_stream};
@@ -111,7 +109,7 @@ fn tone(apu: &mut Apu, frequency: u32, dest: &mut [Complex32]) {
 /// Gets every possible frame offset to pick the best candidate.
 ///
 /// Output of this iterator represents a matrix with samples converted into
-/// complex values, while each column represents a samples within one frame.
+/// complex values, while each row represents a samples within one frame.
 struct ComplexSamplesInSlidingFrames {
     offset: usize,
     samples_per_frame: usize,
@@ -152,11 +150,11 @@ impl ComplexSamplesInSlidingFrames {
     fn pick_best_mimic_tones(self) -> BestTones {
         struct Context {
             samples_per_frame: usize,
-            lower_nonconjugate_nrows: usize,
+            lower_nonconjugate_ncols: usize,
             conjugate_rows: Range<usize>,
             forward_fft: Arc<dyn Fft<f32>>,
             fft_descale: f32,
-            tone_spectrums: na::DMatrix<f32>,
+            tone_spectrums: Array2<f32>,
             original_descale: Vec<NotNan<f32>>,
             progress_bar: ProgressBar,
         }
@@ -169,13 +167,13 @@ impl ComplexSamplesInSlidingFrames {
                     conjugate_rows: 1..(samples_per_frame + 1) / 2,
                     forward_fft: fft_planner.plan_fft_forward(samples_per_frame),
                     fft_descale: fourier_scale_factor(samples_per_frame),
-                    tone_spectrums: na::DMatrix::zeros(
+                    tone_spectrums: Array2::zeros([
                         lower_nonconjugate_nrows,
                         (MAX_FREQUENCY - MIN_FREQUENCY).try_into().unwrap(),
-                    ),
+                    ]),
                     original_descale: Vec::new(),
                     progress_bar: ProgressBar::new(samples_per_frame.try_into().unwrap()),
-                    lower_nonconjugate_nrows,
+                    lower_nonconjugate_ncols: lower_nonconjugate_nrows,
                     samples_per_frame,
                 };
                 out.tone_bases_init();
@@ -189,7 +187,7 @@ impl ComplexSamplesInSlidingFrames {
                         Complex32::zero();
                         self.forward_fft.get_inplace_scratch_len()
                     ],
-                    tone_spectrum_scaled: na::DVector::zeros(self.lower_nonconjugate_nrows),
+                    tone_spectrum_scaled: Array1::zeros(self.lower_nonconjugate_ncols),
                 }
             }
 
@@ -197,38 +195,40 @@ impl ComplexSamplesInSlidingFrames {
             fn tone_bases_init(&mut self) {
                 self.original_descale = self
                     .tone_spectrums
-                    .par_column_iter_mut()
+                    .axis_iter_mut(Axis(1))
+                    .into_par_iter()
                     .enumerate()
                     .map_init(
                         || {
                             (
                                 vec![Complex32::zero(); self.forward_fft.get_inplace_scratch_len()],
-                                na::DVector::zeros(self.samples_per_frame),
+                                Array1::zeros(self.samples_per_frame),
                                 Apu::new(self.samples_per_frame as u32 * FRAMERATE),
                             )
                         },
                         |(fft_scratch, tone_samples, apu), (column_idx, mut tone_spectrum)| {
                             let frequency = MIN_FREQUENCY + u32::try_from(column_idx).unwrap();
-                            tone(apu, frequency, tone_samples.as_mut_slice());
-                            self.forward_fft
-                                .process_with_scratch(tone_samples.as_mut_slice(), fft_scratch);
+                            tone(apu, frequency, tone_samples.as_slice_mut().unwrap());
+                            self.forward_fft.process_with_scratch(
+                                tone_samples.as_slice_mut().unwrap(),
+                                fft_scratch,
+                            );
                             let tone_spectrum_view =
-                                tone_samples.rows(0, self.lower_nonconjugate_nrows);
+                                tone_samples.slice(s![..self.lower_nonconjugate_ncols]);
                             assert_eq!(tone_spectrum.shape(), tone_spectrum_view.shape());
-                            tone_spectrum
-                                .zip_apply(&tone_spectrum_view, |dest, src| *dest = src.norm());
+                            azip!((dest in &mut tone_spectrum, &src in &tone_spectrum_view) *dest = src.norm());
                             {
                                 tone_spectrum[0] *= self.fft_descale;
                                 tone_spectrum
-                                    .rows_range_mut(self.conjugate_rows.clone())
+                                    .slice_mut(s![self.conjugate_rows.clone()])
                                     .mul_assign(2.0 * self.fft_descale);
                                 if self.samples_per_frame % 2 == 0 {
-                                    tone_spectrum[self.lower_nonconjugate_nrows - 1] *=
+                                    tone_spectrum[self.lower_nonconjugate_ncols - 1] *=
                                         self.fft_descale;
                                 }
                             }
                             let original_descale =
-                                NotNan::new(tone_spectrum.norm().recip()).unwrap();
+                                NotNan::new(tone_spectrum.norm_l2().recip()).unwrap();
                             tone_spectrum *= original_descale.into_inner();
                             // ^ we pick the best orthonormal basis of one vector
                             original_descale
@@ -241,27 +241,27 @@ impl ComplexSamplesInSlidingFrames {
         struct LocalContext<'a> {
             cx: &'a Context,
             fft_scratch: Vec<Complex32>,
-            tone_spectrum_scaled: na::DVector<f32>,
+            tone_spectrum_scaled: Array1<f32>,
         }
 
         impl LocalContext<'_> {
-            fn pick_best_mimic_tones(&mut self, mut frames: na::DMatrix<Complex32>) -> BestTones {
+            fn pick_best_mimic_tones(&mut self, mut frames: Array2<Complex32>) -> BestTones {
                 self.cx
                     .forward_fft
-                    .process_with_scratch(frames.as_mut_slice(), &mut self.fft_scratch);
+                    .process_with_scratch(frames.as_slice_mut().unwrap(), &mut self.fft_scratch);
 
                 let frames = {
                     let fft_descale = fourier_scale_factor(self.cx.samples_per_frame);
                     let mut frames = frames
-                        .rows(0, self.cx.lower_nonconjugate_nrows)
-                        .map(Complex::norm);
+                        .slice(s![..self.cx.lower_nonconjugate_ncols, ..])
+                        .map(|c| c.norm());
                     frames.row_mut(0).mul_assign(fft_descale);
                     frames
-                        .rows_range_mut(self.cx.conjugate_rows.clone())
+                        .slice_mut(s![self.cx.conjugate_rows.clone(), ..])
                         .mul_assign(2.0 * self.cx.fft_descale);
                     if self.cx.samples_per_frame % 2 == 0 {
                         frames
-                            .row_mut(self.cx.lower_nonconjugate_nrows - 1)
+                            .column_mut(self.cx.lower_nonconjugate_ncols - 1)
                             .mul_assign(fft_descale);
                     }
                     frames
@@ -277,57 +277,29 @@ impl ComplexSamplesInSlidingFrames {
             #[cfg_attr(feature = "profile", inline(never))]
             fn pick_best_mimic_tones_impl(
                 &mut self,
-                frames: na::Matrix<f32, na::Dyn, na::Dyn, na::VecStorage<f32, na::Dyn, na::Dyn>>,
+                frames: Array2<f32>,
                 best_tones: &mut BestTones,
             ) {
                 self.cx
                     .tone_spectrums
-                    .column_iter()
+                    .axis_iter(Axis(0))
                     .zip(&self.cx.original_descale)
                     .enumerate()
                     .for_each(
                         |(tone_spectrum_column_idx, (tone_spectrum, original_descale))| {
                             let frequency =
                                 MIN_FREQUENCY + u32::try_from(tone_spectrum_column_idx).unwrap();
-                            frames.column_iter().zip(&mut best_tones.frames).for_each(
-                                |(frame, best_tone)| {
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
+                            frames
+                                .axis_iter(Axis(0))
+                                .zip(&mut best_tones.frames)
+                                .for_each(|(frame, best_tone)| {
                                     let scale = frame.dot(&tone_spectrum);
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    let scale = apple_accelerate::dot_product(
-                                        frame.as_slice(),
-                                        tone_spectrum.as_slice(),
-                                    );
                                     let scale = NotNan::new(scale).unwrap();
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    apple_accelerate::scale(
-                                        tone_spectrum.as_slice(),
-                                        scale.into_inner(),
-                                        self.tone_spectrum_scaled.as_mut_slice(),
-                                    );
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
-                                    {
-                                        self.tone_spectrum_scaled.copy_from(&tone_spectrum);
-                                        self.tone_spectrum_scaled.scale_mut(scale.into_inner());
-                                    }
+                                    self.tone_spectrum_scaled.assign(&tone_spectrum);
+                                    self.tone_spectrum_scaled *= scale.into_inner();
 
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
-                                    let error = self.tone_spectrum_scaled.metric_distance(&frame);
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    let error = apple_accelerate::distance_squared(
-                                        self.tone_spectrum_scaled.as_slice(),
-                                        frame.as_slice(),
-                                    )
-                                    .sqrt();
+                                    let error =
+                                        self.tone_spectrum_scaled.sq_l2_dist(&frame).unwrap();
                                     let error = NotNan::new(error).unwrap();
 
                                     if best_tone.error > error {
@@ -337,8 +309,7 @@ impl ComplexSamplesInSlidingFrames {
                                             error,
                                         };
                                     }
-                                },
-                            );
+                                });
                         },
                     );
                 self.cx.progress_bar.inc(1);
@@ -361,7 +332,7 @@ impl ComplexSamplesInSlidingFrames {
 }
 
 impl Iterator for ComplexSamplesInSlidingFrames {
-    type Item = na::DMatrix<Complex32>;
+    type Item = Array2<Complex32>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset >= self.samples_per_frame {
@@ -374,7 +345,8 @@ impl Iterator for ComplexSamplesInSlidingFrames {
             return None;
         }
         let samples = &samples[..frames * self.samples_per_frame];
-        let out = na::DMatrix::from_column_slice(self.samples_per_frame, frames, samples);
+        let out =
+            Array2::from_shape_vec([self.samples_per_frame, frames], samples.to_vec()).unwrap();
         self.offset += 1;
         Some(out)
     }
@@ -394,31 +366,35 @@ fn fourier_scale_factor(len: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{fourier_scale_factor, na};
+    use super::fourier_scale_factor;
     use fft::{FftPlanner, num_complex::Complex32};
+    use ndarray::Array1;
+    use ndarray_linalg::norm::Norm;
 
     #[test]
     fn spectral_density_scale_factor() {
         const SAMPLE_COUNT: usize = 1024;
 
         let mut fft_planner = FftPlanner::new();
-        let mut v = na::DVector::from_fn(SAMPLE_COUNT, |i, _| {
-            let t = i as f32 * std::f32::consts::TAU / SAMPLE_COUNT as f32;
-            Complex32::from_polar(1.0, t)
-        });
+        let mut v: Array1<Complex32> = (0..SAMPLE_COUNT)
+            .map(|i| {
+                let t = i as f32 * std::f32::consts::TAU / SAMPLE_COUNT as f32;
+                Complex32::from_polar(1.0, t)
+            })
+            .collect();
 
-        let prenorm = v.norm();
+        let prenorm = Norm::norm_l2(&v);
         let scale_factor = fourier_scale_factor(SAMPLE_COUNT);
 
         let fft = fft_planner.plan_fft_forward(SAMPLE_COUNT);
-        fft.process(v.as_mut_slice());
-        v.scale_mut(scale_factor);
+        fft.process(v.as_slice_mut().unwrap());
+        v *= Complex32::from(scale_factor);
         let postnorm = v.norm();
         assert!((prenorm - postnorm) < std::f32::EPSILON);
 
         let fft = fft_planner.plan_fft_inverse(SAMPLE_COUNT);
-        fft.process(v.as_mut_slice());
-        v.scale_mut(scale_factor);
+        fft.process(v.as_slice_mut().unwrap());
+        v *= Complex32::from(scale_factor);
         let preprenorm = v.norm();
         assert!((preprenorm - prenorm) < std::f32::EPSILON);
     }

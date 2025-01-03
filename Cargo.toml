@@ -7,7 +7,9 @@ argh = "0.1.12"
 cartridge = { path = "crates/cartridge" }
 sound-mimic = { path = "." }
 hound = "3.5.1"
-nalgebra = { version = "0.33.2", features = ["rayon"] }
+ndarray = "0.16.1"
+ndarray-stats = "0.6.0"
+ndarray-linalg = { git = "https://github.com/rust-ndarray/ndarray-linalg.git" }
 fft = { package = "rustfft", version = "6.1.0" }
 
 [package]
