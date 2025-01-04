@@ -62,7 +62,7 @@ struct BestTone {
 
 struct BestTones {
     frames: Vec<BestTone>,
-    total_error: NotNan<f32>,
+    error_per_frame: NotNan<f32>,
 }
 
 impl BestTones {
@@ -76,12 +76,19 @@ impl BestTones {
                 };
                 frames
             ],
-            total_error: NotNan::new(f32::INFINITY).unwrap(),
+            error_per_frame: NotNan::new(f32::INFINITY).unwrap(),
         }
     }
 
     fn eval_total_error(&mut self) {
-        self.total_error = self.frames.iter().map(|t| t.error).sum();
+        self.error_per_frame = NotNan::new(
+            self.frames
+                .iter()
+                .map(|t| t.error.into_inner())
+                .sum::<f32>()
+                / self.frames.len() as f32,
+        )
+        .unwrap();
     }
 
     fn max_scale(&self) -> Option<f32> {
@@ -353,7 +360,7 @@ impl ComplexSamplesInSlidingFrames {
                 || cx.local_context(),
                 |lcx, frames| lcx.pick_best_mimic_tones(frames),
             )
-            .min_by_key(|t| t.total_error)
+            .min_by_key(|t| t.error_per_frame)
             .expect("input sound has not enough samples");
         best_mimic_tones.scale_to_fit();
         best_mimic_tones
