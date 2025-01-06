@@ -16,6 +16,8 @@ use ordered_float::NotNan;
 use rayon::prelude::*;
 use sound_mimic::{Apu, FRAMERATE, apu, tone_stream};
 
+mod math;
+
 const MIN_FREQUENCY: u32 = 20;
 const MAX_FREQUENCY: u32 = 20000;
 
@@ -200,7 +202,6 @@ impl ComplexSamplesInSlidingFrames {
                 }
             }
 
-            #[cfg_attr(feature = "profile", inline(never))]
             fn tone_bases_init(&mut self) {
                 self.original_descale = self
                     .tone_spectrums
@@ -234,8 +235,8 @@ impl ComplexSamplesInSlidingFrames {
                                         self.fft_descale;
                                 }
                             }
-                            let original_descale =
-                                NotNan::new(tone_spectrum.norm().recip()).unwrap();
+                            let norm = math::norm(tone_spectrum.as_slice());
+                            let original_descale = NotNan::new(norm.recip()).unwrap();
                             tone_spectrum *= original_descale.into_inner();
                             // ^ we pick the best orthonormal basis of one vector
                             original_descale
@@ -281,7 +282,6 @@ impl ComplexSamplesInSlidingFrames {
                 best_tones
             }
 
-            #[cfg_attr(feature = "profile", inline(never))]
             fn pick_best_mimic_tones_impl(
                 &mut self,
                 frames: na::Matrix<f32, na::Dyn, na::Dyn, na::VecStorage<f32, na::Dyn, na::Dyn>>,
@@ -298,43 +298,20 @@ impl ComplexSamplesInSlidingFrames {
                                 MIN_FREQUENCY + u32::try_from(tone_spectrum_column_idx).unwrap();
                             frames.column_iter().zip(&mut best_tones.frames).for_each(
                                 |(frame, best_tone)| {
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
-                                    let scale = frame.dot(&tone_spectrum);
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    let scale = apple_accelerate::dot_product(
-                                        frame.as_slice(),
-                                        tone_spectrum.as_slice(),
-                                    );
+                                    let scale =
+                                        math::dot(frame.as_slice(), tone_spectrum.as_slice());
                                     let scale = NotNan::new(scale).unwrap();
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    apple_accelerate::scale(
+
+                                    math::scale(
                                         tone_spectrum.as_slice(),
                                         scale.into_inner(),
                                         self.tone_spectrum_scaled.as_mut_slice(),
                                     );
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
-                                    {
-                                        self.tone_spectrum_scaled.copy_from(&tone_spectrum);
-                                        self.tone_spectrum_scaled.scale_mut(scale.into_inner());
-                                    }
 
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "apple-accelerate"
-                                    )))]
-                                    let error = self.tone_spectrum_scaled.metric_distance(&frame);
-                                    #[cfg(all(target_os = "macos", feature = "apple-accelerate"))]
-                                    let error = apple_accelerate::distance_squared(
-                                        self.tone_spectrum_scaled.as_slice(),
+                                    let error = math::distance_destructive(
                                         frame.as_slice(),
-                                    )
-                                    .sqrt();
+                                        self.tone_spectrum_scaled.as_mut_slice(),
+                                    );
                                     let error = NotNan::new(error).unwrap();
 
                                     if best_tone.error > error {

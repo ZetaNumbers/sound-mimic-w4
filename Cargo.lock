@@ -184,6 +184,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6099cdc01846bc367c4e7dd630dc5966dccf36b652fae7a74e17b640411a91b2"
 
 [[package]]
+name = "blas-src"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b95e83dc868db96e69795c0213143095f03de9dd3252f205d4ac716e4076a7e0"
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -228,6 +234,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "wasmtime",
+]
+
+[[package]]
+name = "cblas-sys"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6feecd82cce51b0204cf063f0041d69f24ce83f680d87514b004248e7b0fa65"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -1034,6 +1049,8 @@ version = "0.1.0"
 dependencies = [
  "apple-accelerate",
  "argh",
+ "blas-src",
+ "cblas-sys",
  "hound",
  "indicatif",
  "nalgebra",
