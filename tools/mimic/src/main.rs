@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::BufReader,
+    io::{BufReader, IsTerminal, Read},
     ops::{MulAssign, Range},
     sync::Arc,
 };
@@ -11,7 +11,6 @@ use fft::{
     num_traits::Zero,
 };
 use hw_acceleration::Accelerated;
-use indicatif::ProgressBar;
 use nalgebra as na;
 use ordered_float::NotNan;
 use rayon::prelude::*;
@@ -83,7 +82,7 @@ impl BestTones {
         }
     }
 
-    fn eval_total_error(&mut self) {
+    fn eval_error_per_frame(&mut self) {
         self.error_per_frame = NotNan::new(
             self.frames
                 .iter()
@@ -168,7 +167,6 @@ impl ComplexSamplesInSlidingFrames {
             fft_descale: f32,
             tone_spectrums: na::DMatrix<f32>,
             original_descale: Vec<NotNan<f32>>,
-            progress_bar: ProgressBar,
         }
 
         impl Context {
@@ -184,7 +182,6 @@ impl ComplexSamplesInSlidingFrames {
                         (MAX_FREQUENCY - MIN_FREQUENCY).try_into().unwrap(),
                     ),
                     original_descale: Vec::new(),
-                    progress_bar: ProgressBar::new(samples_per_frame.try_into().unwrap()),
                     lower_nonconjugate_nrows,
                     samples_per_frame,
                 };
@@ -279,13 +276,13 @@ impl ComplexSamplesInSlidingFrames {
                 let mut best_tones = BestTones::new(frames.ncols());
 
                 self.pick_best_mimic_tones_impl(frames, &mut best_tones);
-                best_tones.eval_total_error();
+                best_tones.eval_error_per_frame();
                 best_tones
             }
 
             fn pick_best_mimic_tones_impl(
                 &mut self,
-                frames: na::Matrix<f32, na::Dyn, na::Dyn, na::VecStorage<f32, na::Dyn, na::Dyn>>,
+                frames: na::DMatrix<f32>,
                 best_tones: &mut BestTones,
             ) {
                 self.cx
@@ -322,20 +319,71 @@ impl ComplexSamplesInSlidingFrames {
                             );
                         },
                     );
-                self.cx.progress_bar.inc(1);
             }
         }
 
-        let cx = Context::new(self.samples_per_frame);
+        let samples_per_frame = self.samples_per_frame;
+        let cx = Context::new(samples_per_frame);
 
-        let mut best_mimic_tones = self
-            .par_bridge()
-            .map_init(
-                || cx.local_context(),
-                |lcx, frames| lcx.pick_best_mimic_tones(frames),
-            )
-            .min_by_key(|t| t.error_per_frame)
-            .expect("input sound has not enough samples");
+        let (output_tx, output_rx) = crossbeam_channel::unbounded();
+        rayon::spawn(move || {
+            // worksteals while waiting for an iterator to finish too
+            // early finish in case `output_rx` is dropped
+            let _ = self.par_bridge().try_for_each_init(
+                || (cx.local_context(), output_tx.clone()),
+                |(lcx, output_tx), frames| output_tx.send(lcx.pick_best_mimic_tones(frames)),
+            );
+        });
+
+        let mut shifts_traversed = 0;
+        let mut best_mimic_tones = BestTones {
+            frames: vec![],
+            error_per_frame: NotNan::new(f32::INFINITY).unwrap(),
+        };
+
+        struct Halt;
+        let (halt_tx, halt_rx) = crossbeam_channel::bounded(1);
+
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            eprintln!("Press enter when you are satisfied with the generated tones error");
+            std::thread::spawn(move || {
+                for byte in stdin.lock().bytes() {
+                    if byte.unwrap() == b'\n' {
+                        let _ = halt_tx.send(Halt);
+                        return;
+                    }
+                }
+            });
+        }
+
+        // finish when task finishes
+        while let Ok(tones) = output_rx.recv() {
+            let mut update = |tones: BestTones| {
+                if best_mimic_tones.error_per_frame > tones.error_per_frame {
+                    best_mimic_tones = tones
+                }
+                shifts_traversed += 1;
+            };
+
+            update(tones);
+            // debounce
+            while let Ok(tones) = output_rx.try_recv() {
+                update(tones)
+            }
+
+            eprint!(
+                "\x1b[K[Shifts {:03}/{:03}, Error per frame {}]\r",
+                shifts_traversed, samples_per_frame, best_mimic_tones.error_per_frame
+            );
+
+            if let Ok(Halt) = halt_rx.try_recv() {
+                eprint!("\x1b[KHalting preemptively");
+                drop(output_rx);
+                break;
+            }
+        }
+        eprintln!();
         best_mimic_tones.scale_to_fit();
         best_mimic_tones
     }
