@@ -15,7 +15,7 @@ struct RecordCartridgeTones {
     #[argh(positional)]
     frames: usize,
     /// load gamestate (memory) from stdin, see
-    /// https://github.com/aduros/wasm4/issues/553#issuecomment-1847569775
+    /// <https://github.com/aduros/wasm4/issues/553#issuecomment-1847569775>
     /// to learn how to extract gamestate from a running cartridge
     #[argh(switch)]
     load_stdin: bool,
