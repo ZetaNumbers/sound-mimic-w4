@@ -1,0 +1,11 @@
+[package]
+name = "visualizer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.14"
+bevy_egui = "0.30"
+bevy_vello = "0.6.1"
+rustfft = "6.2.0"
+log = { version = "*", features = ["max_level_debug", "release_max_level_warn"] }
